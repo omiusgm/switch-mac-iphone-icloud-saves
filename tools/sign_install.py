@@ -99,8 +99,13 @@ def main():
         raise RuntimeError('The upstream installer failed. Check its output before retrying.')
     with tempfile.TemporaryDirectory(prefix='botw-app-check-') as tmp:
         report = Path(tmp) / 'apps.json'
-        subprocess.run(['xcrun', 'devicectl', 'device', 'info', 'apps', '--device', udid,
-                        '--search', bundle, '--json-output', str(report)], env=env, capture_output=True, check=True, timeout=30)
+        try:
+            subprocess.run(['xcrun', 'devicectl', 'device', 'info', 'apps', '--device', udid,
+                            '--search', bundle, '--json-output', str(report)], env=env, capture_output=True, check=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('Install returned, but readback timed out; check the device before retrying.') from None
+        except subprocess.CalledProcessError:
+            raise RuntimeError('Install returned, but readback failed; check the device before retrying.') from None
         apps = json.loads(report.read_text()).get('result', {}).get('apps', [])
     if len([a for a in apps if a.get('bundleIdentifier') == bundle and a.get('version') == '1.6.0']) != 1:
         raise RuntimeError('Install returned success, but the installed app version could not be read back. Check before retrying.')

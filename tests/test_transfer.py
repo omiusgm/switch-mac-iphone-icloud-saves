@@ -68,6 +68,11 @@ class TransferTests(unittest.TestCase):
         with patch.object(t.subprocess, 'run', side_effect=fake_run):
             with self.assertRaises(RuntimeError): t.ensure_stopped('synthetic-device')
         self.assertEqual(list(self.phone.iterdir()), [])
+    def test_device_timeout_does_not_echo_identifier(self):
+        timeout = t.subprocess.TimeoutExpired(['xcrun', '--device', 'private-device-id'], 30)
+        with patch.object(t.subprocess, 'run', side_effect=timeout):
+            with self.assertRaises(t.DeviceUnavailable) as error: t.ensure_stopped('private-device-id')
+        self.assertNotIn('private-device-id', str(error.exception))
 
 
 if __name__ == '__main__': unittest.main()

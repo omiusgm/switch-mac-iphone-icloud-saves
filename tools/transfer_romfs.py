@@ -39,9 +39,12 @@ def ensure_stopped(serial):
         env['DEVELOPER_DIR'] = str(candidate)
     with tempfile.TemporaryDirectory(prefix='botw-process-') as tmp:
         report = Path(tmp) / 'processes.json'
-        r = subprocess.run(['xcrun', 'devicectl', 'device', 'info', 'processes', '--device', serial,
-                            '--search', '/TOTK.app/TOTK', '--json-output', str(report)],
-                           env=env, capture_output=True, timeout=30)
+        try:
+            r = subprocess.run(['xcrun', 'devicectl', 'device', 'info', 'processes', '--device', serial,
+                                '--search', '/TOTK.app/TOTK', '--json-output', str(report)],
+                               env=env, capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise DeviceUnavailable('Timed out checking the iPhone. Connect and unlock it.') from None
         if r.returncode or not report.is_file():
             raise DeviceUnavailable('Cannot verify iPhone processes. Connect and unlock the iPhone.')
         processes = json.loads(report.read_text()).get('result', {}).get('runningProcesses')

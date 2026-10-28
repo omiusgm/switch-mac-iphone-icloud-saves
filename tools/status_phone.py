@@ -34,8 +34,11 @@ def main():
         root = Path(tmp)
         def query(name, command):
             path = root / (name + '.json')
-            result = subprocess.run(['xcrun', 'devicectl', *command, '--json-output', str(path)],
-                                    env=env, capture_output=True, timeout=30)
+            try:
+                result = subprocess.run(['xcrun', 'devicectl', *command, '--json-output', str(path)],
+                                        env=env, capture_output=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError('Apple device query timed out; check the connection and unlock the phone.') from None
             if result.returncode or not path.is_file():
                 raise RuntimeError('Apple device query failed; check the connection and unlock the phone.')
             return json.loads(path.read_text()).get('result', {})
@@ -54,9 +57,12 @@ def main():
         if app.get('version') != '1.6.0': raise RuntimeError('The installed game is not BOTW 1.6.0.')
         def copy(source, name):
             dest = root / name
-            r = subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', serial,
-                                '--domain-type', 'appDataContainer', '--domain-identifier', bundle,
-                                '--source', source, '--destination', str(dest)], env=env, capture_output=True, timeout=30)
+            try:
+                r = subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', serial,
+                                    '--domain-type', 'appDataContainer', '--domain-identifier', bundle,
+                                    '--source', source, '--destination', str(dest)], env=env, capture_output=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                return None
             return dest if r.returncode == 0 and dest.is_file() else None
         status_file = copy('Documents/cloud-status.json', 'cloud.json')
         status = json.loads(status_file.read_text()) if status_file else {}
