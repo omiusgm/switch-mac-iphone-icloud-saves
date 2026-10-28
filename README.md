@@ -46,6 +46,8 @@ requirements for using your own copy and system files.
 
 ## How syncing works / Как работает обмен
 
+**English**
+
 1. Mac: the provided launcher checks iCloud before launch and publishes local
    changes after the game closes.
 2. iPhone: select the dedicated `Zelda BOTW` folder once. The game checks it on
@@ -54,6 +56,8 @@ requirements for using your own copy and system files.
    copies; a visible divergence prompts a choice instead of silently replacing
    a branch. iCloud delivery is asynchronous: save, leave the first game, and
    give it time to sync before opening the other device.
+
+**Русский**
 
 1. На Mac дополнительный ярлык проверяет iCloud до запуска и отправляет
    изменения после закрытия игры.
