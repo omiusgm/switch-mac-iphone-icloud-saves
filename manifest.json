@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "Switch games on Mac and iPhone: iCloud saves",
+  "languages": ["ru", "en"],
+  "upstream": "https://github.com/ly05010419/MacNativeGames",
+  "upstream_commit": "ea1ce3b2be23540c4d67df95695f8c70f66cd8e0",
+  "sync_recipe": {"game": "The Legend of Zelda: Breath of the Wild", "version": "1.6.0", "title_id": "01007EF00011E000"},
+  "tested_pair": {"mac": "Apple silicon, macOS 27", "phone": "iPhone 15 Pro, iOS 27.0.1"},
+  "contains_game_assets": false,
+  "contains_keys_or_saves": false,
+  "agent_guide": "AGENTS.md",
+  "human_guides": ["docs/ru.md", "docs/en.md"]
+}

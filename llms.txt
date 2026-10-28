@@ -1,0 +1,15 @@
+# Switch games on Mac and iPhone — iCloud save guide
+
+> A bilingual, source-only guide and save-sync overlay for the MacNativeGames
+> native port of The Legend of Zelda: Breath of the Wild 1.6.0. It is not a
+> universal Nintendo Switch emulator or a universal save format.
+
+- [English guide](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/docs/en.md): prerequisites, build, signing, device and iCloud setup.
+- [Русская инструкция](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/docs/ru.md): требования, сборка, подпись, iPhone и iCloud.
+- [Agent runbook](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/AGENTS.md): owner-controlled inputs, safety and verification.
+- [Sync format and limits](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/docs/sync.md): version graph, backups and offline races.
+- [Upstream](https://github.com/ly05010419/MacNativeGames): individual game ports.
+
+No game content, keys, firmware, compiled IPA, saves, credentials or personal
+device IDs are supplied. Bring your own. The verified cross-save example is
+BOTW 1.6.0 only; do not infer compatibility with another game or version.
