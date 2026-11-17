@@ -26,6 +26,18 @@ Game data, translation mods, saves, keys, signed applications, credentials and p
 
 In a separate clean nxnative checkout at the exact commit above, run `git apply --check /path/to/chosen.patch`, then, only for a separate experimental build, `git apply /path/to/chosen.patch`. Copy `src/CloudSaveCore.swift` and `src/FECloudController.swift` into `dm/ios/Sources/`: these were new files and are not included in the diff. Confirm the build includes the Swift files and links `fe_cloud_prepare`. Both patches passed an applicability check on a temporary archive of the pinned commit, without building or launching a game. The tests in this directory do not exercise the UI or rendering changes.
 
+## Translation and DLC
+
+The translation mod and DLC files are kept outside this repository. In one
+local iOS build, 1,904 translation files and six DLC images were checked
+against their source files. This verifies file contents, not DLC translation
+coverage, translation on macOS, or gameplay after a new build.
+
+The partial public patches do not include external translation integration.
+For your own build, use files compatible with your game version and verify the
+integration separately. Back up your mods, DLC and progress before updating;
+do not publish game data, keys or save files.
+
 ## Attribution and licence
 
 The patches contain portions of nxnative, copyright 2026 seedds, MIT licensed: [licenses/nxnative-MIT.txt](licenses/nxnative-MIT.txt). This experiment is not an official part of nxnative. The repository's main licence covers its own project materials; third-party components retain their respective rights. Fire Emblem and Nintendo are trademarks of their respective owners; this project is unaffiliated with them.
