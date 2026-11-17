@@ -30,8 +30,10 @@ In a separate clean nxnative checkout at the exact commit above, run `git apply 
 
 The translation mod and DLC files are kept outside this repository. In one
 local iOS build, 1,904 translation files and six DLC images were checked
-against their source files. This verifies file contents, not DLC translation
-coverage, translation on macOS, or gameplay after a new build.
+against their source files. The local Mac configuration uses the same files as
+an external RomFS overlay, and their hashes matched. These checks verify the
+configuration and files, not DLC translation coverage or gameplay after a new
+build.
 
 The partial public patches do not include external translation integration.
 For your own build, use files compatible with your game version and verify the
