@@ -1,0 +1,141 @@
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index c41491e..7c5957f 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -32,11 +32,11 @@
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_SWAP, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+ 
+ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+-static uint64_t g_touch_btn, g_shake_btn;
++static uint64_t g_touch_btn, g_shake_btn, g_gesture_btn;
+ static int32_t g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry;
+ static void publish(void) {   // the touch gamepad and the shake; the host ORs them with player 1's controller and takes whichever stick is deflected more (hle_hid.c)
+     pthread_mutex_lock(&g_mu);
+-    dm_input_set(g_touch_btn | g_shake_btn, g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry);
++    dm_input_set(g_touch_btn | g_shake_btn | g_gesture_btn, g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry);
+     pthread_mutex_unlock(&g_mu);
+ }
+ 
+@@ -121,7 +121,7 @@ static void phone_motion_start(void) {
+ static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+ int dm_opmode(void);   // hle_oe.c: 0 = handheld
+ 
+-@interface DmGamepad : UIView
++@interface DmGamepad : UIView <UIGestureRecognizerDelegate>
+ @end
+ static __weak DmGamepad *g_view;
+ static void pads_start(void);   // Physical controllers, below
+@@ -142,6 +142,8 @@ @implementation DmGamepad {
+     CALayer *_controls;                            // holds every control layer: hidden while a physical controller is connected (the view itself stays, for game touches)
+     BOOL _padOff;                                  // a physical controller is connected: every touch goes to the game
+     UITouch *_game[16];                            // touches on the game's touch screen by finger slot
++    NSTimeInterval _gestureReady;
++    NSUInteger _gestureEpoch;
+ }
+ 
+ static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
+@@ -186,9 +188,20 @@ - (instancetype)initWithFrame:(CGRect)f {
+         _swap = shape(_controls); _swapLabel = label(_swap, @"");
+         NSNumber *saved = [NSUserDefaults.standardUserDefaults objectForKey:k_layout_key];
+         int l = saved ? (int)saved.integerValue : DM_GAME_PAD_LAYOUT;
+-        if (l == 2 && dm_opmode() != 0) l = 0;   // Tap only in handheld mode (env.txt's DM_OPMODE may have changed it)
+         _full = l == 1; _tap = l == 2;
+         [self applyLayout];
++        // Three Houses has no native touch menus: translate simple gestures to
++        // controller buttons only in the optional button-free layout.
++        UITapGestureRecognizer *one = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(feTap:)];
++        UITapGestureRecognizer *two = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(feTap:)];
++        two.numberOfTouchesRequired = 2;
++        [one requireGestureRecognizerToFail:two];
++        for (UIGestureRecognizer *r in @[one, two]) { r.delegate = self; r.cancelsTouchesInView = NO; [self addGestureRecognizer:r]; }
++        for (NSNumber *direction in @[@(UISwipeGestureRecognizerDirectionUp), @(UISwipeGestureRecognizerDirectionDown), @(UISwipeGestureRecognizerDirectionLeft), @(UISwipeGestureRecognizerDirectionRight)]) {
++            UISwipeGestureRecognizer *r = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(feSwipe:)];
++            r.direction = direction.unsignedIntegerValue; r.delegate = self; r.cancelsTouchesInView = NO;
++            [one requireGestureRecognizerToFail:r]; [self addGestureRecognizer:r];
++        }
+         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+         [nc addObserver:self selector:@selector(padsChanged:) name:GCControllerDidConnectNotification object:nil];
+         [nc addObserver:self selector:@selector(padsChanged:) name:GCControllerDidDisconnectNotification object:nil];
+@@ -207,7 +220,7 @@ - (void)applyLayout {   // show / hide the controls for the current layout
+     [CATransaction commit];
+ }
+ - (void)nextLayout {   // 2D → 3D (→ Tap in handheld mode) → 2D: release every touch first (no key stays held), save, lay out again
+-    int l = _tap ? 0 : _full ? (dm_opmode() == 0 ? 2 : 0) : 1;
++    int l = _tap ? 0 : _full ? 2 : 1;
+     [self reset];
+     _full = l == 1; _tap = l == 2;
+     [NSUserDefaults.standardUserDefaults setObject:@(l) forKey:k_layout_key];
+@@ -253,6 +266,36 @@ - (int)btnAt:(CGPoint)p {   // locked keys (tested on touch-down only, then lock
+     return -1;
+ }
+ - (BOOL)inSwap:(CGPoint)p { return dist(p, self.swapCenter) <= K_SWAP_R * self.u * 1.6; }
++- (BOOL)gestureRecognizer:(UIGestureRecognizer *)recognizer shouldReceiveTouch:(UITouch *)touch {
++    (void)recognizer;
++    return _tap && !_padOff && ![self inSwap:[touch locationInView:self]];
++}
++- (void)fePulse:(int)bit {
++    if (!_tap || _padOff) return;
++    NSTimeInterval now = CACurrentMediaTime();
++    if (_gestureReady > now + 0.65) return; // Bound queued actions if the screen is tapped rapidly.
++    NSTimeInterval start = MAX(now, _gestureReady); _gestureReady = start + 0.18;
++    NSUInteger epoch = _gestureEpoch;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((start - now) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++        if (self->_gestureEpoch != epoch || !self->_tap || self->_padOff) return;
++        LOG("fire emblem touch gesture: controller button %d", bit);
++        pthread_mutex_lock(&g_mu); g_gesture_btn |= 1ull << bit; pthread_mutex_unlock(&g_mu); publish();
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++            if (self->_gestureEpoch != epoch) return;
++            pthread_mutex_lock(&g_mu); g_gesture_btn &= ~(1ull << bit); pthread_mutex_unlock(&g_mu); publish();
++        });
++    });
++}
++- (void)feTap:(UITapGestureRecognizer *)recognizer {
++    if (recognizer.state == UIGestureRecognizerStateRecognized) [self fePulse:recognizer.numberOfTouchesRequired == 2 ? B_B : B_A];
++}
++- (void)feSwipe:(UISwipeGestureRecognizer *)recognizer {
++    if (recognizer.state != UIGestureRecognizerStateRecognized) return;
++    int bit = recognizer.direction == UISwipeGestureRecognizerDirectionUp ? B_UP :
++              recognizer.direction == UISwipeGestureRecognizerDirectionDown ? B_DOWN :
++              recognizer.direction == UISwipeGestureRecognizerDirectionLeft ? B_LEFT : B_RIGHT;
++    [self fePulse:bit];
++}
+ - (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count)
+     uint64_t m = 0; CGFloat r = self.faceR * 1.25;
+     for (int b = B_A; b <= B_Y; b++) if (dist(p, [self facePos:b]) <= r) m |= 1ull << b;
+@@ -373,7 +416,8 @@ - (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {
+ }
+ - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
+ - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
+-- (void)reset { [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
++- (void)reset { _gestureEpoch++; _gestureReady = 0; pthread_mutex_lock(&g_mu); g_gesture_btn = 0; pthread_mutex_unlock(&g_mu);
++    [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
+ 
+ // ---- Shapes ----
+ static CGPathRef circlePath(CGPoint c, CGFloat r) { return CGPathCreateWithEllipseInRect(CGRectMake(c.x - r, c.y - r, 2 * r, 2 * r), NULL); }
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 45aa526..3d6e4a7 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -51,6 +51,10 @@ - (void)startGame;
+ @end
+ static DmRootVC *g_root;
+ static void launcher_done(void) { [g_root startGame]; }
++extern void fe_cloud_prepare(void *presenter, const char *profile, void (*completion)(void));
++static void cloud_done(void) {
++    if (!dm_show_launcher((__bridge void *)g_root, launcher_done)) [g_root startGame];
++}
+ @implementation DmRootVC
+ - (void)viewDidLoad {
+     [super viewDidLoad];
+@@ -104,7 +108,10 @@ - (void)viewDidAppear:(BOOL)a {
+     }
+     if (self.launched || !front_ios_boot_ok()) return;
+     self.launched = YES; g_root = self;
+-    if (!dm_show_launcher((__bridge void *)self, launcher_done)) [self startGame];   // the settings screen first (Launcher.swift), when the app has one
++    // The committed profile is imported before the guest mounts its save.
++    const char *profile = getenv("DM_SAVE");
++    if (profile) fe_cloud_prepare((__bridge void *)self, profile, cloud_done);
++    else cloud_done();
+ }
+ - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+ - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits

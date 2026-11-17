@@ -1,0 +1,3863 @@
+--- /dev/null
++++ b/games/totk/ios/Sources/BOTWGraphicsSettings.h
+@@ -0,0 +1,49 @@
++#pragma once
++#import <UIKit/UIKit.h>
++#include "botw_picture.h"
++
++typedef NS_ENUM(NSInteger, BOTWSceneQuality) {
++    BOTWSceneQualityFaster, BOTWSceneQualityBalanced, BOTWSceneQualitySharper
++};
++
++@protocol BOTWGraphicsSettingsDelegate <NSObject>
++- (void)graphicsSetMetalFX:(BOOL)on;
++- (void)graphicsSetOutputRows:(long)rows;
++- (BOOL)graphicsSetSceneQualityForNextLaunch:(BOTWSceneQuality)quality;
++- (BOOL)graphicsSceneQualitySaveWarning;
++- (void)settingsSetTouchCameraSensitivity:(NSInteger)percent;
++- (void)settingsSetFloatingCameraStick:(BOOL)enabled;
++- (void)graphicsSetFormat:(BOTWPictureFormat)format;
++- (void)graphicsSetDocked:(BOOL)docked;
++- (void)settingsSetSwipeControls:(BOOL)enabled;
++- (void)settingsEditSheikahLayout;
++- (NSString *)graphicsMetalStatus;
++- (void)graphicsSettingsClosed;
++- (void)graphicsSettingsDidDismiss;
++@optional
++- (NSInteger)graphicsDisplayedFPS;
++- (BOOL)graphicsSetOverlayMode:(int)mode;
++@end
++
++UIColor *BOTWGraphicsPanelBackground(void);
++
++@interface BOTWGraphicsSettings : UIViewController
++@property(nonatomic, weak) id<BOTWGraphicsSettingsDelegate> delegate;
++@property(nonatomic) int overlayMode;
++@property(nonatomic) BOOL overlayForcedOff;
++@property(nonatomic) BOOL metalFX;
++@property(nonatomic) BOOL metalFXSupported;
++@property(nonatomic) long outputRows;
++@property(nonatomic) BOOL sceneQualitySupported;
++@property(nonatomic) BOTWSceneQuality sceneQualityCurrent, sceneQualityNext;
++@property(nonatomic) BOOL sceneQualityRecovered, sceneQualityCommitFailed;
++@property(nonatomic) BOOL touchCameraSupported;
++@property(nonatomic) BOOL floatingCameraSupported, floatingCameraStick;
++@property(nonatomic) NSInteger touchCameraSensitivity;
++@property(nonatomic) BOTWPictureFormat format;
++@property(nonatomic) BOOL dockedCurrent;
++@property(nonatomic) BOOL dockedNext;
++@property(nonatomic) BOOL dockedRecovered;
++@property(nonatomic) BOOL showsTouchSettings;
++@property(nonatomic) BOOL swipeControls;
++@end
+--- /dev/null
++++ b/games/totk/ios/Sources/BOTWGraphicsSettings.m
+@@ -0,0 +1,466 @@
++#import "BOTWGraphicsSettings.h"
++#include "fps_overlay.h"
++#include <math.h>
++
++static const int overlayModes[] = {HUD_MODE_OFF, HUD_MODE_MINIMAL, HUD_MODE_ALL};
++
++static NSInteger overlaySelection(int mode) {
++    if (mode == HUD_MODE_OFF) return 0;
++    return mode == HUD_MODE_MINIMAL ? 1 : 2;
++}
++
++UIColor *BOTWGraphicsPanelBackground(void) {
++    return [UIColor colorWithWhite:0.10 alpha:1];
++}
++
++static UILabel *textLabel(NSString *text, UIFontTextStyle style, UIColor *color) {
++    UILabel *label = [UILabel new];
++    label.text = text;
++    label.font = [UIFont preferredFontForTextStyle:style];
++    label.textColor = color;
++    label.adjustsFontForContentSizeCategory = YES;
++    label.numberOfLines = 0;
++    return label;
++}
++
++static UILabel *detailLabel(NSString *text) {
++    return textLabel(text, UIFontTextStyleFootnote, [UIColor colorWithWhite:0.80 alpha:1]);
++}
++
++static UIStackView *addSection(UIStackView *stack, NSString *title, UIView *control, UILabel *detail) {
++    UILabel *heading = textLabel(title, UIFontTextStyleHeadline, UIColor.whiteColor);
++    heading.accessibilityTraits |= UIAccessibilityTraitHeader;
++    NSMutableArray *items = [NSMutableArray arrayWithObjects:heading, control, nil];
++    if (detail) [items addObject:detail];
++    UIStackView *section = [[UIStackView alloc] initWithArrangedSubviews:items];
++    section.axis = UILayoutConstraintAxisVertical;
++    section.spacing = 8;
++    [stack addArrangedSubview:section];
++    return section;
++}
++
++static UISegmentedControl *choices(NSArray<NSString *> *titles, NSInteger selection, NSString *name,
++                                   id target, SEL action) {
++    UISegmentedControl *control = [[UISegmentedControl alloc] initWithItems:titles];
++    control.selectedSegmentIndex = selection;
++    control.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
++    control.selectedSegmentTintColor = [UIColor colorWithWhite:0.34 alpha:1];
++    NSDictionary *ink = @{NSForegroundColorAttributeName: UIColor.whiteColor};
++    [control setTitleTextAttributes:ink forState:UIControlStateNormal];
++    [control setTitleTextAttributes:ink forState:UIControlStateSelected];
++    control.accessibilityLabel = name;
++    [control addTarget:target action:action forControlEvents:UIControlEventValueChanged];
++    [control.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
++    return control;
++}
++
++static NSArray<NSString *> *qualityNames(void) { return @[@"Экономия", @"Баланс", @"Чётче"]; }
++static NSArray<NSString *> *qualityPixels(void) { return @[@"640×360", @"768×432", @"960×540"]; }
++
++static UIStackView *verticalStack(void) {
++    UIStackView *stack = [UIStackView new];
++    stack.axis = UILayoutConstraintAxisVertical;
++    stack.spacing = 20;
++    return stack;
++}
++
++@interface BOTWTouchSensitivitySlider : UISlider
++@end
++
++@implementation BOTWTouchSensitivitySlider
++- (void)accessibilityIncrement { [self adjustBy:25]; }
++- (void)accessibilityDecrement { [self adjustBy:-25]; }
++- (void)adjustBy:(float)step {
++    self.value = MIN(self.maximumValue, MAX(self.minimumValue, self.value + step));
++    [self sendActionsForControlEvents:UIControlEventValueChanged];
++}
++@end
++
++@implementation BOTWGraphicsSettings {
++    UILabel *_metalDetail;
++    UILabel *_modeDetail;
++    UILabel *_fpsDetail;
++    NSTimer *_statusTimer;
++    UIButton *_editLayout;
++    UIScrollView *_scroll;
++    UIStackView *_summary;
++    UIStackView *_primaryGraphics;
++    UIStackView *_qualityChoices;
++    NSArray<UIButton *> *_qualityButtons;
++    UILabel *_qualityStatus, *_sensitivityValue, *_scrollHint;
++}
++
++- (void)viewDidLoad {
++    [super viewDidLoad];
++    self.title = self.showsTouchSettings || self.touchCameraSupported ? @"Настройки" : @"Графика";
++    self.view.backgroundColor = BOTWGraphicsPanelBackground();
++    self.navigationItem.rightBarButtonItem =
++        [[UIBarButtonItem alloc] initWithTitle:@"Готово" style:UIBarButtonItemStylePlain
++                                      target:self action:@selector(done)];
++    UIScrollView *scroll = _scroll = [UIScrollView new];
++    scroll.translatesAutoresizingMaskIntoConstraints = NO;
++    scroll.backgroundColor = BOTWGraphicsPanelBackground();
++    scroll.opaque = YES;
++    [self.view addSubview:scroll];
++    UIStackView *stack = [UIStackView new];
++    stack.axis = UILayoutConstraintAxisVertical;
++    stack.spacing = 20;
++    stack.translatesAutoresizingMaskIntoConstraints = NO;
++    [scroll addSubview:stack];
++    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
++    [NSLayoutConstraint activateConstraints:@[
++        [scroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
++        [scroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
++        [scroll.topAnchor constraintEqualToAnchor:safe.topAnchor],
++        [scroll.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
++        [stack.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor constant:20],
++        [stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor constant:-20],
++        [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:16],
++        [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-24],
++        [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-40]
++    ]];
++
++    _summary = verticalStack();
++    _summary.spacing = 6;
++    _scrollHint = detailLabel(self.touchCameraSupported ? @"Камера и другие настройки ниже" : @"Другие настройки ниже");
++    _scrollHint.accessibilityIdentifier = @"settings.scroll.hint";
++    _scrollHint.isAccessibilityElement = NO;
++    _scrollHint.hidden = YES;
++    [_summary addArrangedSubview:_scrollHint];
++    [_summary addArrangedSubview:detailLabel(@"Игра продолжается. Кнопки и стики временно отключены.")];
++    _fpsDetail = detailLabel(@"");
++    [_summary addArrangedSubview:_fpsDetail];
++    [stack addArrangedSubview:_summary];
++    [self updateFPSDetail];
++
++    UIStackView *scene = verticalStack(), *display = verticalStack();
++    if (self.sceneQualitySupported) [self addSceneQualityTo:scene];
++    NSInteger outputIndex = self.outputRows == 720 ? 0 : self.outputRows == 1080 ? 1 : self.outputRows == 0 ? 2 : UISegmentedControlNoSegment;
++    UISegmentedControl *output = choices(@[@"720p", @"1080p", @"Экран"], outputIndex,
++                                         @"Разрешение вывода", self, @selector(outputChanged:));
++    output.accessibilityIdentifier = @"settings.output";
++    addSection(display, @"Разрешение вывода", output,
++               detailLabel(@"Размер готового кадра. Меняется сразу. «Экран» использует разрешение дисплея."));
++    _primaryGraphics = verticalStack();
++    if (scene.arrangedSubviews.count) [_primaryGraphics addArrangedSubview:scene];
++    [_primaryGraphics addArrangedSubview:display];
++    [stack addArrangedSubview:_primaryGraphics];
++
++    if (self.touchCameraSupported) {
++        BOTWTouchSensitivitySlider *slider = [BOTWTouchSensitivitySlider new];
++        slider.minimumValue = 75;
++        slider.maximumValue = 200;
++        slider.value = self.touchCameraSensitivity >= 75 && self.touchCameraSensitivity <= 200 ? self.touchCameraSensitivity : 100;
++        slider.minimumTrackTintColor = [UIColor colorWithRed:.65 green:.82 blue:1 alpha:1];
++        slider.accessibilityLabel = @"Скорость экранной камеры";
++        slider.accessibilityIdentifier = @"settings.camera.speed";
++        slider.accessibilityHint = @"Меняет чувствительность экранной камеры";
++        [slider.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
++        [slider addTarget:self action:@selector(touchCameraChanged:) forControlEvents:UIControlEventValueChanged];
++        _sensitivityValue = textLabel(@"", UIFontTextStyleCallout, UIColor.whiteColor);
++        _sensitivityValue.isAccessibilityElement = NO;
++        _sensitivityValue.textAlignment = NSTextAlignmentRight;
++        [_sensitivityValue setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
++        [_sensitivityValue.widthAnchor constraintGreaterThanOrEqualToConstant:50].active = YES;
++        UIStackView *speed = [[UIStackView alloc] initWithArrangedSubviews:@[slider, _sensitivityValue]];
++        speed.spacing = 12;
++        speed.alignment = UIStackViewAlignmentCenter;
++        [self updateSensitivity:slider];
++        UIStackView *camera = addSection(stack, @"Скорость камеры", speed,
++            detailLabel(@"Чем выше, тем меньше движения пальца нужно для поворота. Предельную скорость задаёт настройка камеры в самой Zelda. Отклик геймпада не меняется."));
++        camera.accessibilityIdentifier = @"settings.camera.section";
++    }
++    if (self.floatingCameraSupported) {
++        UISegmentedControl *mode = choices(@[@"Стик", @"Свайпы"], self.floatingCameraStick ? 0 : 1,
++                                             @"Способ управления экранной камерой", self, @selector(cameraModeChanged:));
++        mode.accessibilityIdentifier = @"settings.camera.mode";
++        addSection(stack, @"Камера", mode,
++            detailLabel(@"В режиме «Шиика» стик появляется в точке касания и исчезает, когда отпускаете палец."));
++    }
++    if (self.showsTouchSettings) {
++        UISegmentedControl *touch = choices(@[@"Классика", @"Шиика"], self.swipeControls ? 1 : 0,
++                                             @"Управление", self, @selector(touchChanged:));
++        addSection(stack, @"Управление", touch,
++                   detailLabel(@"В режиме «Шиика» двигайся слева и поворачивай камеру справа. Нажми на руну, чтобы использовать её; удерживай для выбора. Лук и бросок можно навести, удерживая кнопку и ведя пальцем."));
++        _editLayout = [UIButton buttonWithType:UIButtonTypeSystem];
++        UIButtonConfiguration *edit = [UIButtonConfiguration tintedButtonConfiguration];
++        edit.title = @"Изменить раскладку";
++        edit.image = [UIImage systemImageNamed:@"arrow.up.and.down.and.arrow.left.and.right"];
++        edit.imagePadding = 7;
++        edit.baseForegroundColor = [UIColor colorWithRed:.65 green:.82 blue:1 alpha:1];
++        _editLayout.configuration = edit;
++        _editLayout.accessibilityIdentifier = @"sheikah.settings.edit";
++        _editLayout.hidden = !self.swipeControls;
++        [_editLayout addTarget:self action:@selector(editLayout) forControlEvents:UIControlEventTouchUpInside];
++        NSLayoutConstraint *editHeight = [_editLayout.heightAnchor constraintGreaterThanOrEqualToConstant:44];
++        editHeight.priority = UILayoutPriorityRequired - 1;
++        editHeight.active = YES;
++        UIStackView *touchSection = (UIStackView *)stack.arrangedSubviews.lastObject;
++        [touchSection insertArrangedSubview:_editLayout atIndex:2];
++
++    }
++
++    BOOL compact = self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPhone &&
++                   !UIContentSizeCategoryIsAccessibilityCategory(self.traitCollection.preferredContentSizeCategory);
++    UIStackView *left = stack, *right = stack;
++    if (compact) {
++        left = [UIStackView new]; right = [UIStackView new];
++        left.axis = right.axis = UILayoutConstraintAxisVertical;
++        left.spacing = right.spacing = stack.spacing;
++        UIStackView *columns = [[UIStackView alloc] initWithArrangedSubviews:@[left, right]];
++        columns.distribution = UIStackViewDistributionFillEqually;
++        columns.alignment = UIStackViewAlignmentTop;
++        columns.spacing = 20;
++        [stack addArrangedSubview:columns];
++    }
++
++    UISegmentedControl *format = choices(@[@"Авто", @"16:9", @"Обрезка"], self.format,
++                                         @"Формат экрана", self, @selector(formatChanged:));
++    addSection(right, @"Формат экрана", format,
++               detailLabel(@"Меняется сразу. «Авто» включает широкую камеру на широком экране. «Обрезка» может скрыть края игрового интерфейса."));
++
++    if ([self.delegate respondsToSelector:@selector(graphicsSetOverlayMode:)]) {
++        NSString *title = @"Показатели поверх игры";
++        NSInteger selection = self.overlayForcedOff ? UISegmentedControlNoSegment : overlaySelection(self.overlayMode);
++        UISegmentedControl *overlay = choices(@[@"Выкл", @"FPS", @"Подробнее"], selection,
++                                               title, self, @selector(overlayChanged:));
++        overlay.enabled = !self.overlayForcedOff;
++        NSString *help = self.overlayForcedOff
++            ? @"Строка FPS скрыта параметром запуска. Остальные показатели зависят от настроек запуска."
++            : @"«FPS» показывает частоту и разрешение. «Подробнее» добавляет доступные строки диагностики.";
++        overlay.accessibilityHint = help;
++        addSection(left, title, overlay, detailLabel(help));
++    }
++
++    UILabel *metalTitle = textLabel(@"MetalFX", UIFontTextStyleHeadline, UIColor.whiteColor);
++    UISwitch *metal = [UISwitch new];
++    metal.on = self.metalFX;
++    metal.enabled = self.metalFXSupported;
++    metal.accessibilityLabel = @"MetalFX";
++    [metal setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
++    [metal addTarget:self action:@selector(metalChanged:) forControlEvents:UIControlEventValueChanged];
++    UIStackView *metalRow = [[UIStackView alloc] initWithArrangedSubviews:@[metalTitle, metal]];
++    metalRow.alignment = UIStackViewAlignmentCenter;
++    metalRow.spacing = 12;
++    _metalDetail = detailLabel(@"");
++    UIStackView *metalSection = [[UIStackView alloc] initWithArrangedSubviews:@[metalRow, _metalDetail]];
++    metalSection.axis = UILayoutConstraintAxisVertical;
++    metalSection.spacing = 8;
++    [left addArrangedSubview:metalSection];
++    [self updateMetalDetail];
++
++    UISegmentedControl *mode = choices(@[@"Портативный", @"Стационарный"], self.dockedNext ? 1 : 0,
++                                       @"Режим Switch", self, @selector(modeChanged:));
++    _modeDetail = detailLabel(@"");
++    addSection(right, @"Режим Switch", mode, _modeDetail);
++    [self updateModeDetail];
++}
++
++- (void)addSceneQualityTo:(UIStackView *)stack {
++    NSArray<NSString *> *names = qualityNames(), *pixels = qualityPixels();
++    NSMutableArray *buttons = [NSMutableArray new];
++    for (NSInteger index = 0; index < (NSInteger)names.count; index++) {
++        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
++        UIButtonConfiguration *config = [UIButtonConfiguration plainButtonConfiguration];
++        config.title = names[index];
++        config.subtitle = pixels[index];
++        config.titleAlignment = UIButtonConfigurationTitleAlignmentCenter;
++        config.titlePadding = 2;
++        config.contentInsets = NSDirectionalEdgeInsetsMake(6, 4, 6, 4);
++        config.baseForegroundColor = UIColor.whiteColor;
++        config.cornerStyle = UIButtonConfigurationCornerStyleMedium;
++        button.configuration = config;
++        button.tag = index;
++        button.accessibilityLabel = names[index];
++        button.accessibilityHint = @"Качество 3D применяется после полного перезапуска";
++        button.accessibilityIdentifier = [NSString stringWithFormat:@"settings.quality.%ld", (long)index];
++        [button addTarget:self action:@selector(sceneQualityChanged:) forControlEvents:UIControlEventTouchUpInside];
++        [button.heightAnchor constraintGreaterThanOrEqualToConstant:48].active = YES;
++        [buttons addObject:button];
++    }
++    _qualityButtons = buttons.copy;
++    _qualityChoices = [[UIStackView alloc] initWithArrangedSubviews:_qualityButtons];
++    _qualityChoices.distribution = UIStackViewDistributionFillEqually;
++    _qualityChoices.spacing = 3;
++    _qualityChoices.layer.cornerRadius = 10;
++    _qualityChoices.backgroundColor = [UIColor colorWithWhite:.18 alpha:1];
++    _qualityStatus = detailLabel(@"");
++    _qualityStatus.accessibilityIdentifier = @"settings.quality.status";
++    addSection(stack, @"Качество 3D", _qualityChoices, _qualityStatus);
++    [self updateSceneQuality];
++}
++
++- (void)viewDidLayoutSubviews {
++    [super viewDidLayoutSubviews];
++    // Measure the natural content height without the hint so the hint itself
++    // cannot make a previously fitting panel scroll.
++    CGFloat viewportHeight = CGRectGetHeight(_scroll.bounds);
++    CGFloat contentHeight = _scroll.contentSize.height;
++    if (!_scrollHint.hidden) contentHeight -= CGRectGetHeight(_scrollHint.bounds) + _summary.spacing;
++    _scrollHint.hidden = !(viewportHeight > 0 && contentHeight > viewportHeight + .5);
++    CGFloat width = CGRectGetWidth(_scroll.bounds) - 40;
++    BOOL accessibility = UIContentSizeCategoryIsAccessibilityCategory(self.traitCollection.preferredContentSizeCategory);
++    BOOL sideBySide = width >= 560 && !accessibility;
++    _primaryGraphics.axis = sideBySide ? UILayoutConstraintAxisHorizontal : UILayoutConstraintAxisVertical;
++    _primaryGraphics.distribution = sideBySide ? UIStackViewDistributionFillEqually : UIStackViewDistributionFill;
++    _primaryGraphics.alignment = sideBySide ? UIStackViewAlignmentTop : UIStackViewAlignmentFill;
++    CGFloat qualityWidth = sideBySide ? (width - _primaryGraphics.spacing) / 2 : width;
++    _qualityChoices.axis = qualityWidth < 280 || accessibility ? UILayoutConstraintAxisVertical : UILayoutConstraintAxisHorizontal;
++}
++
++- (void)updateSceneQuality {
++    NSArray<NSString *> *names = qualityNames(), *pixels = qualityPixels();
++    NSInteger current = self.sceneQualityCurrent, next = self.sceneQualityNext;
++    if (current < 0 || current >= (NSInteger)names.count) current = BOTWSceneQualitySharper;
++    if (next < 0 || next >= (NSInteger)names.count) next = current;
++    for (UIButton *button in _qualityButtons) {
++        BOOL selected = button.tag == next;
++        UIButtonConfiguration *config = button.configuration;
++        config.background.backgroundColor = [UIColor colorWithWhite:selected ? .34 : .18 alpha:1];
++        button.configuration = config;
++        button.accessibilityValue = [NSString stringWithFormat:@"%@%@", pixels[button.tag],
++            button.tag == current && !self.dockedCurrent ? @", сейчас" :
++            (selected ? (self.dockedNext ? @", для портативного режима" : @", после перезапуска") : @"")];
++        if (selected) button.accessibilityTraits |= UIAccessibilityTraitSelected;
++        else button.accessibilityTraits &= ~UIAccessibilityTraitSelected;
++    }
++    NSString *selectedPreset = [NSString stringWithFormat:@"«%@» · %@", names[next], pixels[next]];
++    NSString *selectedStatus = @"Для смены полностью перезапустите игру.";
++    if (self.dockedNext) {
++        selectedStatus = [NSString stringWithFormat:@"Выбор сохранён для портативного режима — %@. Стационарный режим использует своё разрешение.", selectedPreset];
++    } else if (self.dockedCurrent || current != next) {
++        selectedStatus = [NSString stringWithFormat:@"После полного перезапуска в портативном режиме — %@. Полностью закройте игру и откройте её снова.", selectedPreset];
++    }
++    NSString *active = self.dockedCurrent ? @"Сейчас стационарный режим использует своё разрешение."
++        : [NSString stringWithFormat:@"Сейчас «%@» · %@", names[current], pixels[current]];
++    _qualityStatus.text = [NSString stringWithFormat:@"Размер 3D-сцены в портативном режиме.\n%@\n%@", active, selectedStatus];
++    if (self.sceneQualityRecovered)
++        _qualityStatus.text = [_qualityStatus.text stringByAppendingString:@"\nПосле незавершённого запуска восстановлено последнее рабочее качество."];
++    if (self.sceneQualityCommitFailed)
++        _qualityStatus.text = [_qualityStatus.text stringByAppendingString:@"\nНе удалось сохранить данные запуска. Для следующего запуска выберите качество ещё раз."];
++}
++
++- (void)sceneQualityChanged:(UIButton *)button {
++    BOTWSceneQuality quality = (BOTWSceneQuality)button.tag;
++    BOOL saved = [self.delegate graphicsSetSceneQualityForNextLaunch:quality];
++    if (saved) {
++        self.sceneQualityNext = quality;
++        self.sceneQualityCommitFailed = [self.delegate graphicsSceneQualitySaveWarning];
++    }
++    [self updateSceneQuality];
++    if (!saved) {
++        NSString *message = @"Качество не сохранилось. Нажмите на вариант ещё раз.";
++        _qualityStatus.text = [_qualityStatus.text stringByAppendingFormat:@"\n%@", message];
++        UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, message);
++    }
++}
++
++- (void)updateSensitivity:(UISlider *)slider {
++    NSString *value = [NSString stringWithFormat:@"%ld%%", (long)lroundf(slider.value)];
++    _sensitivityValue.text = value;
++    slider.accessibilityValue = value;
++}
++
++- (void)touchCameraChanged:(UISlider *)slider {
++    NSInteger percent = lroundf(slider.value / 25) * 25;
++    slider.value = percent;
++    self.touchCameraSensitivity = percent;
++    [self updateSensitivity:slider];
++    [self.delegate settingsSetTouchCameraSensitivity:percent];
++}
++
++- (void)cameraModeChanged:(UISegmentedControl *)control {
++    self.floatingCameraStick = control.selectedSegmentIndex == 0;
++    [self.delegate settingsSetFloatingCameraStick:self.floatingCameraStick];
++}
++
++- (void)viewDidAppear:(BOOL)animated {
++    [super viewDidAppear:animated];
++    [self updateMetalDetail];
++    __weak typeof(self) weakSelf = self;
++    [self updateFPSDetail];
++    _statusTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) {
++        [weakSelf updateMetalDetail];
++        [weakSelf updateFPSDetail];
++    }];
++}
++
++- (void)viewDidDisappear:(BOOL)animated {
++    [super viewDidDisappear:animated];
++    [_statusTimer invalidate];
++    _statusTimer = nil;
++    if (self.isBeingDismissed || self.navigationController.isBeingDismissed)
++        [self.delegate graphicsSettingsDidDismiss];
++}
++
++- (void)updateMetalDetail {
++    NSString *detail = self.metalFXSupported ? [self.delegate graphicsMetalStatus]
++                                             : @"Устройство не поддерживает этот вариант MetalFX.";
++    if (![_metalDetail.text isEqualToString:detail]) _metalDetail.text = detail;
++}
++
++- (void)updateFPSDetail {
++    id<BOTWGraphicsSettingsDelegate> delegate = self.delegate;
++    NSInteger fps = [delegate respondsToSelector:@selector(graphicsDisplayedFPS)] ? [delegate graphicsDisplayedFPS] : -1;
++    NSString *detail = fps > 0
++        ? [NSString stringWithFormat:@"На экране %ld FPS.", (long)fps]
++        : @"Пока нет замера FPS.";
++    if (![_fpsDetail.text isEqualToString:detail]) _fpsDetail.text = detail;
++}
++
++- (void)updateModeDetail {
++    NSString *current = self.dockedCurrent ? @"Сейчас стационарный." : @"Сейчас портативный.";
++    NSString *restart = self.dockedNext == self.dockedCurrent
++        ? @"Смена режима требует перезапуска."
++        : @"Сохрани игру, полностью закрой приложение и открой снова.";
++    NSString *recovery = self.dockedRecovered ? @" После незавершённого запуска восстановлен портативный режим." : @"";
++    _modeDetail.text = [NSString stringWithFormat:@"%@ %@ Стационарный режим экспериментальный и может сильнее нагружать устройство.%@",
++                        current, restart, recovery];
++}
++
++- (void)overlayChanged:(UISegmentedControl *)control {
++    NSInteger selected = control.selectedSegmentIndex;
++    id<BOTWGraphicsSettingsDelegate> delegate = self.delegate;
++    if (!self.overlayForcedOff && selected >= 0 && selected < (NSInteger)(sizeof overlayModes / sizeof overlayModes[0]) &&
++        [delegate respondsToSelector:@selector(graphicsSetOverlayMode:)] &&
++        [delegate graphicsSetOverlayMode:overlayModes[selected]]) {
++        self.overlayMode = overlayModes[selected];
++    } else {
++        control.selectedSegmentIndex = self.overlayForcedOff ? UISegmentedControlNoSegment : overlaySelection(self.overlayMode);
++    }
++}
++
++- (void)metalChanged:(UISwitch *)control {
++    [self.delegate graphicsSetMetalFX:control.on];
++    [self updateMetalDetail];
++}
++
++- (void)outputChanged:(UISegmentedControl *)control {
++    static const long rows[] = {720, 1080, 0};
++    [self.delegate graphicsSetOutputRows:rows[control.selectedSegmentIndex]];
++}
++
++- (void)formatChanged:(UISegmentedControl *)control {
++    [self.delegate graphicsSetFormat:(BOTWPictureFormat)control.selectedSegmentIndex];
++}
++
++- (void)modeChanged:(UISegmentedControl *)control {
++    self.dockedNext = control.selectedSegmentIndex == 1;
++    [self.delegate graphicsSetDocked:self.dockedNext];
++    [self updateModeDetail];
++    if (self.sceneQualitySupported) [self updateSceneQuality];
++}
++
++- (void)touchChanged:(UISegmentedControl *)control {
++    self.swipeControls = control.selectedSegmentIndex == 1;
++    _editLayout.hidden = !self.swipeControls;
++    [self.delegate settingsSetSwipeControls:self.swipeControls];
++}
++
++- (void)editLayout { [self.delegate settingsEditSheikahLayout]; }
++
++- (void)done {
++    [self.delegate graphicsSettingsClosed];
++}
++
++@end
+--- /dev/null
++++ b/games/totk/ios/Sources/BOTWSheikahEditor.h
+@@ -0,0 +1,9 @@
++#import "BOTWSheikahHUD.h"
++
++@interface BOTWSheikahEditor : UIView
++- (instancetype)initWithFrame:(CGRect)frame
++                    overrides:(BOTWSheikahOverrides *)overrides
++                         icon:(UIImage *(^)(BOTWSheikahControl control))icon
++                   completion:(void (^)(BOTWSheikahOverrides *saved))completion;
++- (void)showSaveFailure;
++@end
+--- /dev/null
++++ b/games/totk/ios/Sources/BOTWSheikahEditor.m
+@@ -0,0 +1,376 @@
++#import "BOTWSheikahEditor.h"
++#include <math.h>
++
++@interface BOTWSheikahEditorElement : UIAccessibilityElement
++@property(nonatomic, copy) void (^selectControl)(void);
++@end
++
++@implementation BOTWSheikahEditorElement
++- (BOOL)accessibilityActivate {
++    if (!self.selectControl) return NO;
++    self.selectControl();
++    return YES;
++}
++@end
++
++@implementation BOTWSheikahEditor {
++    NSMutableDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *_draft;
++    UIImage *(^_icon)(BOTWSheikahControl);
++    void (^_completion)(BOTWSheikahOverrides *);
++    UIView *_toolbar, *_inspector;
++    UILabel *_title, *_status, *_selectedLabel, *_scale;
++    NSLayoutConstraint *_actionsWidth, *_accessibleActionsWidth;
++    BOOL _largeType, _saveFailed;
++    UIButton *_save, *_cancel, *_reset, *_smaller, *_bigger;
++    NSUInteger _selected;
++    UITouch *_tracking;
++    CGPoint _grabOffset, _grabPoint;
++    CGRect _grabArea;
++    BOOL _dragging;
++}
++
++static UIColor *panelColor(void) {
++    return [UIColor colorWithRed:.06 green:.10 blue:.12 alpha:.94];
++}
++
++static UIColor *accentColor(void) {
++    return [UIColor colorWithRed:.63 green:.94 blue:.98 alpha:1];
++}
++
++static UIFont *editorFont(UIFontTextStyle style, UITraitCollection *traits, CGFloat maximumSize) {
++    UIFont *font = [UIFont preferredFontForTextStyle:style compatibleWithTraitCollection:traits];
++    return font.pointSize > maximumSize ? [font fontWithSize:maximumSize] : font;
++}
++
++static UILabel *editorLabel(NSString *text, UIFontTextStyle style) {
++    UILabel *label = [UILabel new];
++    label.text = text;
++    label.font = [UIFont preferredFontForTextStyle:style];
++    label.adjustsFontForContentSizeCategory = YES;
++    label.adjustsFontSizeToFitWidth = YES;
++    label.minimumScaleFactor = .75;
++    label.textColor = UIColor.whiteColor;
++    return label;
++}
++
++static UIView *editorPanel(void) {
++    UIView *panel = [UIView new];
++    panel.backgroundColor = panelColor();
++    panel.layer.cornerRadius = 12;
++    return panel;
++}
++
++- (UIButton *)button:(NSString *)title icon:(NSString *)icon action:(SEL)action id:(NSString *)identifier {
++    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
++    UIButtonConfiguration *config = [UIButtonConfiguration plainButtonConfiguration];
++    config.title = title;
++    config.image = icon ? [UIImage systemImageNamed:icon] : nil;
++    config.preferredSymbolConfigurationForImage = [UIImageSymbolConfiguration configurationWithTextStyle:UIFontTextStyleCallout
++                                                                                                 scale:UIImageSymbolScaleSmall];
++    config.baseForegroundColor = UIColor.whiteColor;
++    config.contentInsets = NSDirectionalEdgeInsetsMake(0, 9, 0, 9);
++    config.titleTextAttributesTransformer = ^NSDictionary *(NSDictionary *attributes) {
++        NSMutableDictionary *style = [attributes mutableCopy];
++        style[NSFontAttributeName] = editorFont(UIFontTextStyleCallout, nil, 27);
++        return style;
++    };
++    button.configuration = config;
++    button.titleLabel.adjustsFontSizeToFitWidth = YES;
++    button.titleLabel.minimumScaleFactor = .7;
++    button.accessibilityIdentifier = identifier;
++    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
++    return button;
++}
++
++- (instancetype)initWithFrame:(CGRect)frame
++                    overrides:(BOTWSheikahOverrides *)overrides
++                         icon:(UIImage *(^)(BOTWSheikahControl))icon
++                   completion:(void (^)(BOTWSheikahOverrides *))completion {
++    if ((self = [super initWithFrame:frame])) {
++        self.opaque = NO;
++        self.backgroundColor = UIColor.clearColor;
++        self.contentMode = UIViewContentModeRedraw;
++        self.accessibilityViewIsModal = YES;
++        self.accessibilityIdentifier = @"sheikah.editor";
++        _draft = [overrides mutableCopy] ?: [NSMutableDictionary new];
++        _icon = [icon copy];
++        _completion = [completion copy];
++        _selected = BOTWSheikahEditableCount;
++
++        _toolbar = editorPanel();
++        [self addSubview:_toolbar];
++        _title = editorLabel(@"Раскладка «Шиика»", UIFontTextStyleHeadline);
++        _title.accessibilityTraits = UIAccessibilityTraitHeader;
++        _title.adjustsFontForContentSizeCategory = NO;
++        _status = editorLabel(@"Перетащите кнопку", UIFontTextStyleCaption1);
++        _status.adjustsFontForContentSizeCategory = NO;
++        _status.accessibilityIdentifier = @"sheikah.editor.status";
++        UIStackView *heading = [[UIStackView alloc] initWithArrangedSubviews:@[_title, _status]];
++        heading.axis = UILayoutConstraintAxisVertical;
++        heading.spacing = 1;
++        heading.translatesAutoresizingMaskIntoConstraints = NO;
++        [heading setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
++        [_toolbar addSubview:heading];
++
++        _cancel = [self button:@"Отмена" icon:nil action:@selector(cancel) id:@"sheikah.editor.cancel"];
++        _reset = [self button:@"Стандарт" icon:nil action:@selector(reset) id:@"sheikah.editor.reset"];
++        _reset.accessibilityLabel = @"Стандартная раскладка";
++        _save = [self button:@"Сохранить" icon:nil action:@selector(save) id:@"sheikah.editor.save"];
++        UIButtonConfiguration *saveConfig = _save.configuration;
++        saveConfig.baseForegroundColor = accentColor();
++        _save.configuration = saveConfig;
++        UIStackView *actions = [[UIStackView alloc] initWithArrangedSubviews:@[_cancel, _reset, _save]];
++        actions.spacing = 1;
++        actions.distribution = UIStackViewDistributionFillEqually;
++        actions.translatesAutoresizingMaskIntoConstraints = NO;
++        [_toolbar addSubview:actions];
++        _actionsWidth = [actions.widthAnchor constraintEqualToAnchor:_toolbar.widthAnchor multiplier:.71];
++        _accessibleActionsWidth = [actions.widthAnchor constraintEqualToAnchor:_toolbar.widthAnchor multiplier:.63];
++        [NSLayoutConstraint activateConstraints:@[
++            [heading.leadingAnchor constraintEqualToAnchor:_toolbar.leadingAnchor constant:12],
++            [heading.centerYAnchor constraintEqualToAnchor:_toolbar.centerYAnchor],
++            [heading.heightAnchor constraintLessThanOrEqualToAnchor:_toolbar.heightAnchor constant:-2],
++            [heading.trailingAnchor constraintEqualToAnchor:actions.leadingAnchor constant:-6],
++            [actions.trailingAnchor constraintEqualToAnchor:_toolbar.trailingAnchor constant:-4],
++            _actionsWidth,
++            [actions.topAnchor constraintEqualToAnchor:_toolbar.topAnchor],
++            [actions.bottomAnchor constraintEqualToAnchor:_toolbar.bottomAnchor],
++            [_cancel.widthAnchor constraintGreaterThanOrEqualToConstant:44],
++            [_reset.widthAnchor constraintGreaterThanOrEqualToConstant:44],
++            [_save.widthAnchor constraintGreaterThanOrEqualToConstant:44]
++        ]];
++
++        _inspector = editorPanel();
++        [self addSubview:_inspector];
++        _selectedLabel = editorLabel(@"Выберите кнопку", UIFontTextStyleCallout);
++        _scale = editorLabel(@"", UIFontTextStyleFootnote);
++        _scale.textAlignment = NSTextAlignmentCenter;
++        _scale.accessibilityIdentifier = @"sheikah.editor.scale";
++        _smaller = [self button:nil icon:@"minus" action:@selector(shrink) id:@"sheikah.editor.smaller"];
++        _smaller.accessibilityLabel = @"Уменьшить кнопку";
++        _bigger = [self button:nil icon:@"plus" action:@selector(grow) id:@"sheikah.editor.bigger"];
++        _bigger.accessibilityLabel = @"Увеличить кнопку";
++        UIStackView *inspectorContent = [[UIStackView alloc] initWithArrangedSubviews:@[_selectedLabel, _smaller, _scale, _bigger]];
++        inspectorContent.translatesAutoresizingMaskIntoConstraints = NO;
++        [_inspector addSubview:inspectorContent];
++        [NSLayoutConstraint activateConstraints:@[
++            [inspectorContent.leadingAnchor constraintEqualToAnchor:_inspector.leadingAnchor constant:12],
++            [inspectorContent.trailingAnchor constraintEqualToAnchor:_inspector.trailingAnchor constant:-3],
++            [inspectorContent.topAnchor constraintEqualToAnchor:_inspector.topAnchor constant:2],
++            [inspectorContent.bottomAnchor constraintEqualToAnchor:_inspector.bottomAnchor constant:-2],
++            [_smaller.widthAnchor constraintEqualToConstant:44],
++            [_bigger.widthAnchor constraintEqualToConstant:44],
++            [_scale.widthAnchor constraintGreaterThanOrEqualToConstant:49],
++            [_scale.widthAnchor constraintLessThanOrEqualToConstant:65]
++        ]];
++        [self registerForTraitChanges:@[UITraitPreferredContentSizeCategory.class] withAction:@selector(setNeedsLayout)];
++        [self updateControls];
++    }
++    return self;
++}
++
++- (CGRect)area { return UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); }
++
++- (void)layoutSubviews {
++    [super layoutSubviews];
++    CGRect area = self.area;
++    _toolbar.frame = CGRectMake(CGRectGetMinX(area) + 6, CGRectGetMinY(area) + 6, MAX(0, CGRectGetWidth(area) - 12), 46);
++    _inspector.frame = BOTWSheikahEditorInspectorFrame(area);
++    BOOL largeType = UIContentSizeCategoryIsAccessibilityCategory(self.traitCollection.preferredContentSizeCategory);
++    if (_largeType != largeType) {
++        _largeType = largeType;
++        (_largeType ? _actionsWidth : _accessibleActionsWidth).active = NO;
++        (_largeType ? _accessibleActionsWidth : _actionsWidth).active = YES;
++    }
++    _title.font = editorFont(UIFontTextStyleHeadline, self.traitCollection, 26);
++    _status.font = editorFont(_largeType ? UIFontTextStyleCallout : UIFontTextStyleCaption1, self.traitCollection, 24);
++    [self updateControls];
++}
++
++- (void)safeAreaInsetsDidChange {
++    [super safeAreaInsetsDidChange];
++    [self setNeedsLayout];
++}
++
++- (double)selectedScale {
++    if (_selected >= BOTWSheikahEditableCount) return 1;
++    return [_draft[BOTWSheikahEditKey(_selected)][@"scale"] doubleValue] ?: 1;
++}
++
++- (void)updateControls {
++    BOOL selected = _selected < BOTWSheikahEditableCount;
++    CGFloat scale = self.selectedScale;
++    _selectedLabel.text = selected ? BOTWSheikahEditLabel(_selected) : @"Выберите кнопку";
++    _scale.text = selected ? [NSString stringWithFormat:@"%ld%%", lround(scale * 100)] : @"";
++    _smaller.enabled = selected && scale > .5;
++    _bigger.enabled = selected && scale < 2;
++    BOTWSheikahLayoutIssue issue = BOTWSheikahValidateLayout(self.area, _draft);
++    BOOL valid = issue == BOTWSheikahLayoutValid;
++    BOOL hasMessage = !valid || _saveFailed;
++    _save.enabled = valid;
++    _title.hidden = _largeType && hasMessage;
++    _status.hidden = _largeType && !hasMessage;
++    switch (issue) {
++        case BOTWSheikahLayoutValid: _status.text = _saveFailed ? @"Не удалось сохранить" : @"Перетащите кнопку"; break;
++        case BOTWSheikahLayoutOverlappingControls: _status.text = @"Кнопки перекрываются"; break;
++        case BOTWSheikahLayoutUnderEditorPanel: _status.text = @"Кнопка заходит на панель"; break;
++        case BOTWSheikahLayoutRuneFanClipped: _status.text = @"Мало места для рун"; break;
++        case BOTWSheikahLayoutRuneFanOverlap: _status.text = @"Веер закрывает кнопку"; break;
++    }
++    _status.textColor = hasMessage ? [UIColor colorWithRed:1 green:.83 blue:.48 alpha:1]
++                                   : [UIColor colorWithRed:.74 green:.86 blue:.89 alpha:1];
++    self.accessibilityHint = @"Перетащите кнопку, чтобы переместить её";
++    [self setNeedsDisplay];
++}
++
++- (void)selectAtPoint:(CGPoint)point {
++    _selected = BOTWSheikahEditHit(BOTWSheikahLayoutApply(self.area, _draft), point);
++    [self updateControls];
++}
++
++- (void)moveSelectionTo:(CGPoint)point {
++    if (_selected >= BOTWSheikahEditableCount || CGRectIsEmpty(self.area)) return;
++    CGRect area = self.area;
++    NSString *key = BOTWSheikahEditKey(_selected);
++    NSMutableDictionary *entry = [_draft[key] mutableCopy] ?: [NSMutableDictionary new];
++    entry[@"x"] = @(MIN(1, MAX(0, (point.x - CGRectGetMinX(area)) / CGRectGetWidth(area))));
++    entry[@"y"] = @(MIN(1, MAX(0, (point.y - CGRectGetMinY(area)) / CGRectGetHeight(area))));
++    _draft[key] = entry.copy;
++    _saveFailed = NO;
++    [self updateControls];
++}
++
++- (void)resizeSelectionBy:(NSInteger)step {
++    if (_selected >= BOTWSheikahEditableCount) return;
++    NSString *key = BOTWSheikahEditKey(_selected);
++    NSMutableDictionary *entry = [_draft[key] mutableCopy] ?: [NSMutableDictionary new];
++    NSInteger scale = MIN(20, MAX(5, lround(self.selectedScale * 10) + step));
++    if (scale == 10) [entry removeObjectForKey:@"scale"];
++    else entry[@"scale"] = @(scale / 10.0);
++    _draft[key] = entry.count ? entry.copy : nil;
++    _saveFailed = NO;
++    [self updateControls];
++}
++
++- (void)shrink { [self resizeSelectionBy:-1]; }
++- (void)grow { [self resizeSelectionBy:1]; }
++
++- (void)reset {
++    [_draft removeAllObjects];
++    _saveFailed = NO;
++    [self updateControls];
++}
++
++- (void)save {
++    if (BOTWSheikahLayoutCanSave(self.area, _draft) && _completion) _completion(_draft.copy);
++}
++
++- (void)showSaveFailure {
++    _saveFailed = YES;
++    [self updateControls];
++    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, _status.text);
++}
++
++- (void)cancel { if (_completion) _completion(nil); }
++
++- (BOOL)accessibilityPerformEscape {
++    [self cancel];
++    return YES;
++}
++
++- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    (void)event;
++    if (_tracking) return;
++    _tracking = touches.anyObject;
++    _grabPoint = [_tracking locationInView:self];
++    _grabArea = self.area;
++    _dragging = NO;
++    [self selectAtPoint:_grabPoint];
++    if (_selected < BOTWSheikahEditableCount) {
++        CGPoint center = BOTWSheikahEditTarget(BOTWSheikahLayoutApply(self.area, _draft), _selected).center;
++        _grabOffset = CGPointMake(center.x - _grabPoint.x, center.y - _grabPoint.y);
++    }
++}
++
++- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    (void)event;
++    if (!_tracking || ![touches containsObject:_tracking] || !CGRectEqualToRect(self.area, _grabArea)) return;
++    CGPoint point = [_tracking locationInView:self];
++    if (!_dragging && hypot(point.x - _grabPoint.x, point.y - _grabPoint.y) < 3) return;
++    _dragging = YES;
++    [self moveSelectionTo:CGPointMake(point.x + _grabOffset.x, point.y + _grabOffset.y)];
++}
++
++- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    (void)event;
++    if (_tracking && [touches containsObject:_tracking]) _tracking = nil;
++}
++
++- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    [self touchesEnded:touches withEvent:event];
++}
++
++- (NSArray *)accessibilityElements {
++    NSMutableArray *elements = [NSMutableArray arrayWithObjects:_toolbar, nil];
++    BOTWSheikahLayout layout = BOTWSheikahLayoutApply(self.area, _draft);
++    __weak typeof(self) weakSelf = self;
++    for (NSUInteger i = 0; i < BOTWSheikahEditableCount; i++) {
++        BOTWSheikahEditorElement *element = [[BOTWSheikahEditorElement alloc] initWithAccessibilityContainer:self];
++        element.accessibilityLabel = BOTWSheikahEditLabel(i);
++        element.accessibilityIdentifier = [@"sheikah.editor.control." stringByAppendingString:BOTWSheikahEditKey(i)];
++        element.accessibilityTraits = UIAccessibilityTraitButton | (i == _selected ? UIAccessibilityTraitSelected : 0);
++        element.accessibilityFrameInContainerSpace = BOTWSheikahEditTarget(layout, i).hit;
++        element.selectControl = ^{
++            BOTWSheikahEditor *editor = weakSelf;
++            if (!editor) return;
++            editor->_selected = i;
++            [editor updateControls];
++        };
++        NSArray *names = @[@"Сдвинуть влево", @"Сдвинуть вправо", @"Сдвинуть вверх", @"Сдвинуть вниз"];
++        const CGFloat deltas[4][2] = {{-12, 0}, {12, 0}, {0, -12}, {0, 12}};
++        NSMutableArray *actions = [NSMutableArray new];
++        for (NSUInteger j = 0; j < names.count; j++) {
++            CGPoint delta = CGPointMake(deltas[j][0], deltas[j][1]);
++            [actions addObject:[[UIAccessibilityCustomAction alloc] initWithName:names[j]
++                actionHandler:^BOOL(UIAccessibilityCustomAction *action) {
++                    BOTWSheikahEditor *editor = weakSelf;
++                    if (!editor) return NO;
++                    editor->_selected = i;
++                    BOTWSheikahLayout draft = BOTWSheikahLayoutApply(editor.area, editor->_draft);
++                    CGPoint center = BOTWSheikahEditTarget(draft, i).center;
++                    [editor moveSelectionTo:CGPointMake(center.x + delta.x, center.y + delta.y)];
++                    return YES;
++                }]];
++        }
++        element.accessibilityCustomActions = actions;
++        [elements addObject:element];
++    }
++    [elements addObject:_inspector];
++    return elements;
++}
++
++- (void)drawRect:(CGRect)rect {
++    [[UIColor colorWithWhite:0 alpha:.30] setFill];
++    UIRectFillUsingBlendMode(rect, kCGBlendModeNormal);
++    CGRect area = self.area;
++    if (CGRectIsEmpty(area)) return;
++    CGContextRef context = UIGraphicsGetCurrentContext();
++    CGContextSaveGState(context);
++    CGContextClipToRect(context, area);
++    BOTWSheikahLayout layout = BOTWSheikahLayoutApply(area, _draft);
++    for (BOTWSheikahControl i = 0; i < BOTWSheikahControlCount; i++) {
++        BOTWSheikahDrawControl(layout.target[i], i, _icon ? _icon(i) : nil, NO);
++    }
++    BOTWSheikahDrawStick(layout.stick, layout.stick, layout.stickRadius, NO);
++    if (_selected < BOTWSheikahEditableCount) {
++        BOTWSheikahTarget target = BOTWSheikahEditTarget(layout, _selected);
++        CGFloat radius = MAX(target.radius * 1.12, 21);
++        UIBezierPath *ring = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(target.center.x - radius,
++                                 target.center.y - radius, radius * 2, radius * 2)];
++        ring.lineWidth = 2;
++        [[UIColor colorWithRed:236/255.0 green:194/255.0 blue:84/255.0 alpha:1] setStroke];
++        [ring stroke];
++    }
++    CGContextRestoreGState(context);
++}
++@end
+--- /dev/null
++++ b/games/totk/ios/Sources/BOTWSheikahHUD.h
+@@ -0,0 +1,51 @@
++#import <UIKit/UIKit.h>
++
++typedef NS_ENUM(NSUInteger, BOTWSheikahControl) {
++    BOTWSheikahWeapon, BOTWSheikahShield, BOTWSheikahUp, BOTWSheikahWhistle, BOTWSheikahCrouch,
++    BOTWSheikahSlate, BOTWSheikahMap, BOTWSheikahInventory, BOTWSheikahRune, BOTWSheikahThrow,
++    BOTWSheikahBow, BOTWSheikahBlock, BOTWSheikahAttack, BOTWSheikahJump, BOTWSheikahSprint,
++    BOTWSheikahInteract, BOTWSheikahCancel, BOTWSheikahArrows, BOTWSheikahControlCount
++};
++
++typedef struct {
++    CGPoint center;
++    CGFloat radius;
++    CGRect hit;
++} BOTWSheikahTarget;
++
++typedef struct {
++    BOTWSheikahTarget target[BOTWSheikahControlCount];
++    CGPoint stick;
++    CGFloat stickRadius, fanInner, fanOuter;
++} BOTWSheikahLayout;
++
++BOTWSheikahLayout BOTWSheikahLayoutMake(CGRect area);
++BOOL BOTWSheikahVisible(BOTWSheikahControl control, uint64_t buttons, BOOL fanOpen);
++BOTWSheikahControl BOTWSheikahHit(BOTWSheikahLayout layout, CGPoint point, uint64_t buttons, BOOL fanOpen);
++uint64_t BOTWSheikahButton(BOTWSheikahControl control);
++NSString *BOTWSheikahLabel(BOTWSheikahControl control);
++int BOTWSheikahFanPick(BOTWSheikahLayout layout, CGPoint point, uint8_t owned);
++void BOTWSheikahDrawControl(BOTWSheikahTarget target, BOTWSheikahControl control, UIImage *item, BOOL held);
++void BOTWSheikahDrawStick(CGPoint center, CGPoint knob, CGFloat radius, BOOL held);
++void BOTWSheikahDrawFan(BOTWSheikahLayout layout, uint8_t owned, int selected, int hovered, NSDictionary<NSNumber *, UIImage *> *runes);
++UIImage *BOTWSheikahSettingsArtwork(void);
++enum { BOTWSheikahSettingsSize = 44, BOTWSheikahSettingsTop = 4 };
++CGRect BOTWSheikahSettingsFrame(CGRect area);
++
++/* Layout records are sparse so untouched controls retain their original anchors and scale. */
++enum { BOTWSheikahMove = BOTWSheikahControlCount, BOTWSheikahEditableCount };
++typedef NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> BOTWSheikahOverrides;
++BOTWSheikahOverrides *BOTWSheikahLoadLayout(NSUserDefaults *defaults);
++BOOL BOTWSheikahSaveLayout(NSUserDefaults *defaults, BOTWSheikahOverrides *overrides);
++BOTWSheikahLayout BOTWSheikahLayoutApply(CGRect area, BOTWSheikahOverrides *overrides);
++BOTWSheikahTarget BOTWSheikahEditTarget(BOTWSheikahLayout layout, NSUInteger index);
++NSUInteger BOTWSheikahEditHit(BOTWSheikahLayout layout, CGPoint point);
++NSString *BOTWSheikahEditLabel(NSUInteger index);
++NSString *BOTWSheikahEditKey(NSUInteger index);
++typedef NS_ENUM(NSUInteger, BOTWSheikahLayoutIssue) {
++    BOTWSheikahLayoutValid, BOTWSheikahLayoutOverlappingControls,
++    BOTWSheikahLayoutUnderEditorPanel, BOTWSheikahLayoutRuneFanClipped, BOTWSheikahLayoutRuneFanOverlap
++};
++BOTWSheikahLayoutIssue BOTWSheikahValidateLayout(CGRect area, BOTWSheikahOverrides *overrides);
++BOOL BOTWSheikahLayoutCanSave(CGRect area, BOTWSheikahOverrides *overrides);
++CGRect BOTWSheikahEditorInspectorFrame(CGRect area);
+--- /dev/null
++++ b/games/totk/ios/Sources/BOTWSheikahHUD.m
+@@ -0,0 +1,497 @@
++// Layout and rune-fan code adapt BOTWRecompAndroid runtime/ui/touch_controls.mm
++// at 3d9beeb0c25c65845e805c91c4bba1bbb860cae9 (Peiikai). See ../licenses/NOTICE.md.
++// Artwork is excluded; the public settings control uses a system gear symbol.
++#import "BOTWSheikahHUD.h"
++#include <float.h>
++#include <math.h>
++
++typedef NS_ENUM(NSUInteger, AtlasSprite) {
++    AtlasButton, AtlasShoulder, AtlasStick, AtlasKnob,
++    AtlasJump, AtlasSprint, AtlasCrouch, AtlasWhistle, AtlasBag
++};
++
++static const struct {
++    uint64_t bit;
++    __unsafe_unretained NSString *key;
++    __unsafe_unretained NSString *label;
++    int action;
++} controls[BOTWSheikahControlCount] = {
++    [BOTWSheikahWeapon] = {1 << 14, @">", @"Сменить оружие", -1},
++    [BOTWSheikahShield] = {1 << 12, @"<", @"Сменить щит", -1},
++    [BOTWSheikahUp] = {1 << 13, @"", @"Крестовина вверх", -1},
++    [BOTWSheikahWhistle] = {1 << 15, @"", @"Свист и крестовина вниз", AtlasWhistle},
++    [BOTWSheikahCrouch] = {1 << 4, @"L3", @"Присесть", AtlasCrouch},
++    [BOTWSheikahSlate] = {1 << 5, @"R3", @"Прицел Шиика", -1},
++    [BOTWSheikahMap] = {1 << 11, @"−", @"Карта", -1},
++    [BOTWSheikahInventory] = {1 << 10, @"+", @"Инвентарь", AtlasBag},
++    [BOTWSheikahRune] = {1 << 6, @"L", @"Руна. Удерживайте для выбора руны", -1},
++    [BOTWSheikahThrow] = {1 << 7, @"R", @"Бросить оружие", -1},
++    [BOTWSheikahBow] = {1 << 9, @"ZR", @"Лук", -1},
++    [BOTWSheikahBlock] = {1 << 8, @"ZL", @"Защита и захват цели", -1},
++    [BOTWSheikahAttack] = {1 << 3, @"Y", @"Удар", -1},
++    [BOTWSheikahJump] = {1 << 2, @"X", @"Прыжок", AtlasJump},
++    [BOTWSheikahSprint] = {1 << 1, @"B", @"Бег и отмена", AtlasSprint},
++    [BOTWSheikahInteract] = {1 << 0, @"A", @"Действие", -1},
++    [BOTWSheikahCancel] = {1 << 1, @"", @"Отменить прицеливание", -1},
++    [BOTWSheikahArrows] = {1 << 12, @"<", @"Сменить стрелы", -1},
++};
++
++uint64_t BOTWSheikahButton(BOTWSheikahControl control) { return controls[control].bit; }
++NSString *BOTWSheikahLabel(BOTWSheikahControl control) { return controls[control].label; }
++
++static CGFloat clamp(CGFloat value, CGFloat low, CGFloat high) { return MAX(low, MIN(value, high)); }
++static const CGFloat runeSliceInset = .025;
++
++BOTWSheikahLayout BOTWSheikahLayoutMake(CGRect area) {
++    // The original uses screen-relative anchors and height-relative radii. Limit the control spread on
++    // tablets and reserve the lower right for the iOS minimap, plus the lower middle for game text.
++    CGFloat width = CGRectGetWidth(area), height = CGRectGetHeight(area);
++    CGFloat left = CGRectGetMinX(area), right = CGRectGetMaxX(area), top = CGRectGetMinY(area);
++    CGFloat edgeWidth = MIN(width, height * 2.45);
++    CGFloat unit = MIN(height, 460);
++    CGFloat leftInset = MAX(22, .054 * edgeWidth), leftStep = MAX(46, .071 * edgeWidth);
++    const struct { CGFloat x, y, r; BOOL right; } anchors[BOTWSheikahControlCount] = {
++        [BOTWSheikahWeapon] = {.054, .56, .050, NO},
++        [BOTWSheikahShield] = {.125, .56, .050, NO},
++        [BOTWSheikahUp] = {.054, .42, .043, NO},
++        [BOTWSheikahWhistle] = {.125, .42, .043, NO},
++        [BOTWSheikahCrouch] = {.190, .820, .046, NO},
++        [BOTWSheikahSlate] = {.195, .56, .043, NO},
++        [BOTWSheikahMap] = {.145, .27, .045, YES},
++        [BOTWSheikahInventory] = {.060, .27, .045, YES},
++        [BOTWSheikahRune] = {.170, .43, .0624, YES},
++        [BOTWSheikahThrow] = {.035, .42, .045, YES},
++        [BOTWSheikahBow] = {.280, .57, .067, YES},
++        [BOTWSheikahBlock] = {.060, .57, .052, YES},
++        [BOTWSheikahAttack] = {.170, .62, .097, YES},
++        [BOTWSheikahJump] = {.280, .720, .050, YES},
++        [BOTWSheikahSprint] = {.030, .855, .050, YES},
++        [BOTWSheikahInteract] = {.060, .715, .050, YES},
++        [BOTWSheikahCancel] = {.265, .42, .050, NO},
++        [BOTWSheikahArrows] = {.195, .42, .050, NO},
++    };
++    BOTWSheikahLayout layout = {0};
++    for (BOTWSheikahControl i = 0; i < BOTWSheikahControlCount; i++) {
++        CGFloat r = unit * anchors[i].r;
++        CGFloat halfHit = MAX(22, r * 1.10);
++        CGFloat x = anchors[i].right ? right - anchors[i].x * edgeWidth
++                                    : left + leftInset + (anchors[i].x - .054) / .071 * leftStep;
++        CGFloat y = top + anchors[i].y * height;
++        x = clamp(x, left + halfHit, right - halfHit);
++        y = clamp(y, top + halfHit, CGRectGetMaxY(area) - halfHit);
++        layout.target[i] = (BOTWSheikahTarget){
++            CGPointMake(x, y), r, CGRectMake(x - halfHit, y - halfHit, 2 * halfHit, 2 * halfHit)
++        };
++    }
++    layout.stickRadius = .13 * unit;
++    layout.stick = CGPointMake(left + MAX(layout.stickRadius + 2, .09 * edgeWidth), top + .75 * height);
++    BOTWSheikahTarget rune = layout.target[BOTWSheikahRune];
++    CGFloat throwEdge = CGRectGetMinX(layout.target[BOTWSheikahThrow].hit);
++    layout.fanInner = rune.radius * 1.2;
++    // Keep the full 44-point throw target available while the rune fan is up.
++    layout.fanOuter = MIN(rune.radius * 3.2, MIN(rune.center.y - top - 4, throwEdge - rune.center.x - 3));
++    return layout;
++}
++
++// Editor behavior adapted from the MIT-licensed BOTWRecompAndroid runtime/ui/touch_controls.mm
++// (3d9beeb0, Peiikai). See BOTWSheikahLicense.txt.
++static NSString *const layoutKey = @"BOTWSheikahLayout.v1";
++
++NSString *BOTWSheikahEditKey(NSUInteger index) {
++    static NSString *const keys[] = {
++        @"weapon", @"shield", @"up", @"whistle", @"crouch", @"slate", @"map", @"inventory", @"rune",
++        @"throw", @"bow", @"block", @"attack", @"jump", @"sprint", @"interact", @"cancel", @"arrows", @"move"
++    };
++    return keys[index];
++}
++
++NSString *BOTWSheikahEditLabel(NSUInteger index) {
++    switch (index) {
++        case BOTWSheikahMove: return @"Движение";
++        case BOTWSheikahRune: return @"Руна";
++        case BOTWSheikahWhistle: return @"Свист";
++        case BOTWSheikahBlock: return @"Защита";
++        default: return BOTWSheikahLabel(index);
++    }
++}
++
++static BOOL numberInRange(id number, double low, double high) {
++    if (![number isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)number) == CFBooleanGetTypeID()) return NO;
++    double value = [number doubleValue];
++    return isfinite(value) && value >= low && value <= high;
++}
++
++BOTWSheikahOverrides *BOTWSheikahLoadLayout(NSUserDefaults *defaults) {
++    id raw = [defaults objectForKey:layoutKey];
++    if (![raw isKindOfClass:NSDictionary.class]) return @{};
++    NSMutableDictionary *overrides = [NSMutableDictionary new];
++    for (NSUInteger i = 0; i < BOTWSheikahEditableCount; i++) {
++        NSString *key = BOTWSheikahEditKey(i);
++        id value = raw[key];
++        if (![value isKindOfClass:NSDictionary.class]) continue;
++        NSMutableDictionary *entry = [NSMutableDictionary new];
++        if (numberInRange(value[@"x"], 0, 1) && numberInRange(value[@"y"], 0, 1)) {
++            entry[@"x"] = value[@"x"];
++            entry[@"y"] = value[@"y"];
++        }
++        if (numberInRange(value[@"scale"], .5, 2)) entry[@"scale"] = value[@"scale"];
++        if (entry.count) overrides[key] = entry.copy;
++    }
++    return overrides.copy;
++}
++
++BOOL BOTWSheikahSaveLayout(NSUserDefaults *defaults, BOTWSheikahOverrides *overrides) {
++    // One property-list value is committed on Save. Wait for this explicit commit
++    // before closing the editor, since the app can be closed immediately afterwards.
++    id previous = [defaults objectForKey:layoutKey];
++    [defaults setObject:overrides forKey:layoutKey];
++    if ([defaults synchronize]) return YES;
++    if (previous) [defaults setObject:previous forKey:layoutKey];
++    else [defaults removeObjectForKey:layoutKey];
++    [defaults synchronize];
++    return NO;
++}
++
++BOTWSheikahTarget BOTWSheikahEditTarget(BOTWSheikahLayout layout, NSUInteger index) {
++    if (index < BOTWSheikahControlCount) return layout.target[index];
++    CGPoint p = layout.stick;
++    CGFloat r = MAX(22, layout.stickRadius);
++    return (BOTWSheikahTarget){p, layout.stickRadius, CGRectMake(p.x - r, p.y - r, r * 2, r * 2)};
++}
++
++CGRect BOTWSheikahEditorInspectorFrame(CGRect area) {
++    CGFloat width = MIN(344, CGRectGetWidth(area) - 16);
++    return CGRectMake(CGRectGetMidX(area) - width / 2, CGRectGetMaxY(area) - 54, width, 48);
++}
++
++CGRect BOTWSheikahSettingsFrame(CGRect area) {
++    return CGRectMake(CGRectGetMidX(area) - BOTWSheikahSettingsSize / 2.0,
++                      CGRectGetMinY(area) + BOTWSheikahSettingsTop,
++                      BOTWSheikahSettingsSize, BOTWSheikahSettingsSize);
++}
++
++BOTWSheikahLayout BOTWSheikahLayoutApply(CGRect area, BOTWSheikahOverrides *overrides) {
++    BOTWSheikahLayout layout = BOTWSheikahLayoutMake(area);
++    if (!overrides.count || CGRectIsEmpty(area)) return layout;
++    for (NSUInteger i = 0; i < BOTWSheikahEditableCount; i++) {
++        NSDictionary *entry = overrides[BOTWSheikahEditKey(i)];
++        if (!entry) continue;
++        BOTWSheikahTarget target = BOTWSheikahEditTarget(layout, i);
++        CGFloat scale = entry[@"scale"] ? [entry[@"scale"] doubleValue] : 1;
++        CGFloat radius = target.radius * scale;
++        CGFloat halfHit = MAX(22, radius * (i == BOTWSheikahMove ? 1 : 1.10));
++        CGPoint center = target.center;
++        if (entry[@"x"] && entry[@"y"]) {
++            center = CGPointMake(CGRectGetMinX(area) + CGRectGetWidth(area) * [entry[@"x"] doubleValue],
++                                 CGRectGetMinY(area) + CGRectGetHeight(area) * [entry[@"y"] doubleValue]);
++        }
++        center.x = clamp(center.x, CGRectGetMinX(area) + halfHit + 3, CGRectGetMaxX(area) - halfHit - 3);
++        center.y = clamp(center.y, CGRectGetMinY(area) + halfHit + 3, CGRectGetMaxY(area) - halfHit - 3);
++        if (i == BOTWSheikahMove) {
++            layout.stick = center;
++            layout.stickRadius = radius;
++        } else {
++            layout.target[i] = (BOTWSheikahTarget){center, radius, CGRectMake(center.x - halfHit, center.y - halfHit,
++                                                                               2 * halfHit, 2 * halfHit)};
++        }
++    }
++    if (overrides[BOTWSheikahEditKey(BOTWSheikahRune)]) {
++        BOTWSheikahTarget rune = layout.target[BOTWSheikahRune];
++        CGFloat left = rune.center.x - CGRectGetMinX(area) - 4;
++        CGFloat top = rune.center.y - CGRectGetMinY(area) - 4;
++        CGFloat right = CGRectGetMaxX(area) - rune.center.x - 4;
++        // A smaller rune button keeps a usable fan. A larger button increases the inner radius.
++        CGFloat band = layout.fanOuter - layout.fanInner;
++        layout.fanInner = MAX(layout.fanInner, rune.radius * 1.2);
++        layout.fanOuter = MIN(layout.fanInner + band, MIN(left, MIN(top, right)));
++    }
++    return layout;
++}
++
++NSUInteger BOTWSheikahEditHit(BOTWSheikahLayout layout, CGPoint point) {
++    NSUInteger selected = BOTWSheikahEditableCount;
++    CGFloat closest = CGFLOAT_MAX;
++    for (NSUInteger i = 0; i < BOTWSheikahEditableCount; i++) {
++        BOTWSheikahTarget target = BOTWSheikahEditTarget(layout, i);
++        if (!CGRectContainsPoint(target.hit, point)) continue;
++        CGFloat distance = hypot(point.x - target.center.x, point.y - target.center.y);
++        if (distance < closest) { selected = i; closest = distance; }
++    }
++    return selected;
++}
++
++static CGFloat hitOverlap(CGRect a, CGRect b) {
++    CGRect common = CGRectIntersection(a, b);
++    return CGRectIsEmpty(common) ? 0 : common.size.width * common.size.height;
++}
++
++static CGFloat centerDistance(BOTWSheikahTarget a, BOTWSheikahTarget b) {
++    return hypot(a.center.x - b.center.x, a.center.y - b.center.y);
++}
++
++static CGFloat circleOverlap(BOTWSheikahTarget a, BOTWSheikahTarget b, CGFloat distance) {
++    CGFloat r = a.radius, s = b.radius;
++    if (distance >= r + s || r <= 0 || s <= 0) return 0;
++    if (distance <= fabs(r - s)) return M_PI * MIN(r * r, s * s);
++    // The intersecting lens consists of one circular segment from each disk.
++    CGFloat aAngle = acos(clamp((distance * distance + r * r - s * s) / (2 * distance * r), -1, 1));
++    CGFloat bAngle = acos(clamp((distance * distance + s * s - r * r) / (2 * distance * s), -1, 1));
++    return r * r * (aAngle - sin(aAngle) * cos(aAngle)) + s * s * (bAngle - sin(bAngle) * cos(bAngle));
++}
++
++static BOOL hitIntersectsRuneFan(CGRect hit, BOTWSheikahLayout layout) {
++    CGFloat inner = layout.fanInner, outer = layout.fanOuter;
++    if (outer <= inner) return NO;
++    CGPoint center = layout.target[BOTWSheikahRune].center;
++    // The single-rune slice is the maximum visible sector. Its straight edges
++    // bound the upper wedge by y <= -tan(inset)*abs(x) in rune-relative coordinates.
++    CGFloat slope = tan(runeSliceInset);
++    CGFloat bottom = CGRectGetMaxY(hit) - center.y;
++    CGFloat top = CGRectGetMinY(hit) - center.y;
++    if (top >= 0) return NO;
++    CGFloat limit = -top / slope;
++    CGFloat left = MAX(CGRectGetMinX(hit) - center.x, -limit);
++    CGFloat right = MIN(CGRectGetMaxX(hit) - center.x, limit);
++    if (left >= right) return NO;
++    CGFloat nearestX = clamp(0, left, right);
++    CGFloat nearestY = MIN(bottom, -slope * fabs(nearestX));
++    CGFloat farthestX = MAX(fabs(left), fabs(right));
++    // Distances over the clipped box fill the interval between its extremes.
++    return hypot(nearestX, nearestY) < outer && hypot(farthestX, top) > inner;
++}
++
++BOTWSheikahLayoutIssue BOTWSheikahValidateLayout(CGRect area, BOTWSheikahOverrides *overrides) {
++    if (!overrides.count || CGRectIsEmpty(area)) return BOTWSheikahLayoutValid;
++    BOTWSheikahLayout base = BOTWSheikahLayoutMake(area);
++    BOTWSheikahLayout draft = BOTWSheikahLayoutApply(area, overrides);
++    CGRect inspector = BOTWSheikahEditorInspectorFrame(area);
++    CGRect toolbar = CGRectMake(CGRectGetMinX(area), CGRectGetMinY(area), CGRectGetWidth(area), 54);
++    for (NSUInteger i = 0; i < BOTWSheikahEditableCount; i++) {
++        if (!overrides[BOTWSheikahEditKey(i)]) continue;
++        BOTWSheikahTarget target = BOTWSheikahEditTarget(draft, i);
++        if (hitOverlap(target.hit, toolbar) > 0 || hitOverlap(target.hit, inspector) > 0)
++            return BOTWSheikahLayoutUnderEditorPanel;
++    }
++    // Include the movement stick and both contextual aiming controls. Cancel and Arrows
++    // can be on screen together while the bow is held.
++    for (NSUInteger i = 0; i < BOTWSheikahEditableCount; i++) {
++        BOTWSheikahTarget a = BOTWSheikahEditTarget(draft, i), originalA = BOTWSheikahEditTarget(base, i);
++        for (NSUInteger j = i + 1; j < BOTWSheikahEditableCount; j++) {
++            if (!overrides[BOTWSheikahEditKey(i)] && !overrides[BOTWSheikahEditKey(j)]) continue;
++            BOTWSheikahTarget b = BOTWSheikahEditTarget(draft, j), originalB = BOTWSheikahEditTarget(base, j);
++            CGFloat before = centerDistance(originalA, originalB), after = centerDistance(a, b);
++            if (after + .01 < MIN(44, before) ||
++                hitOverlap(a.hit, b.hit) > hitOverlap(originalA.hit, originalB.hit) + .0001 ||
++                circleOverlap(a, b, after) > circleOverlap(originalA, originalB, before) + .0001)
++                return BOTWSheikahLayoutOverlappingControls;
++        }
++    }
++    if (overrides[BOTWSheikahEditKey(BOTWSheikahRune)] &&
++        draft.fanOuter - draft.fanInner < MIN(24, base.fanOuter - base.fanInner))
++        return BOTWSheikahLayoutRuneFanClipped;
++
++    CGPoint originalRune = base.target[BOTWSheikahRune].center, movedRune = draft.target[BOTWSheikahRune].center;
++    BOOL fanChanged = !CGPointEqualToPoint(originalRune, movedRune) ||
++        base.fanInner != draft.fanInner || base.fanOuter != draft.fanOuter;
++    if (fanChanged && hitIntersectsRuneFan(BOTWSheikahSettingsFrame(area), draft))
++        return BOTWSheikahLayoutRuneFanOverlap;
++    uint64_t bowHeld = BOTWSheikahButton(BOTWSheikahBow);
++    for (NSUInteger i = 0; i < BOTWSheikahEditableCount; i++) {
++        if (i == BOTWSheikahRune || (i != BOTWSheikahMove && !BOTWSheikahVisible(i, bowHeld, YES))) continue;
++        CGRect hit = BOTWSheikahEditTarget(draft, i).hit;
++        if ((fanChanged || !CGRectEqualToRect(hit, BOTWSheikahEditTarget(base, i).hit)) && hitIntersectsRuneFan(hit, draft))
++            return BOTWSheikahLayoutRuneFanOverlap;
++    }
++    return BOTWSheikahLayoutValid;
++}
++
++BOOL BOTWSheikahLayoutCanSave(CGRect area, BOTWSheikahOverrides *overrides) {
++    return BOTWSheikahValidateLayout(area, overrides) == BOTWSheikahLayoutValid;
++}
++
++BOOL BOTWSheikahVisible(BOTWSheikahControl control, uint64_t buttons, BOOL fanOpen) {
++    if (fanOpen && (control == BOTWSheikahMap || control == BOTWSheikahInventory)) return NO;
++    if (control == BOTWSheikahCancel) return (buttons & (BOTWSheikahButton(BOTWSheikahBow) | BOTWSheikahButton(BOTWSheikahThrow))) != 0;
++    if (control == BOTWSheikahArrows) return (buttons & BOTWSheikahButton(BOTWSheikahBow)) != 0;
++    return YES;
++}
++
++BOTWSheikahControl BOTWSheikahHit(BOTWSheikahLayout layout, CGPoint point, uint64_t buttons, BOOL fanOpen) {
++    BOTWSheikahControl best = BOTWSheikahControlCount;
++    CGFloat closest = CGFLOAT_MAX;
++    for (BOTWSheikahControl i = 0; i < BOTWSheikahControlCount; i++) {
++        BOTWSheikahTarget target = layout.target[i];
++        if (!BOTWSheikahVisible(i, buttons, fanOpen) || !CGRectContainsPoint(target.hit, point)) continue;
++        CGFloat distance = hypot(point.x - target.center.x, point.y - target.center.y);
++        if (distance < closest) { best = i; closest = distance; }
++    }
++    return best;
++}
++
++static UIImage *sprite(AtlasSprite index) {
++    static NSArray<UIImage *> *sprites;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        CGImageRef skin = [UIImage imageNamed:@"BOTWSheikahFrame"].CGImage;
++        CGImageRef actions = [UIImage imageNamed:@"BOTWSheikahActions"].CGImage;
++        // Original UV crop coordinates, in the unmodified 1254-pixel atlas.
++        const CGRect skinRects[] = {{ {24, 26}, {578, 536}}, {{633, 185}, {614, 227}},
++                                    {{22, 617}, {584, 570}}, {{706, 677}, {469, 461}}};
++        NSMutableArray *images = [NSMutableArray array];
++        for (AtlasSprite i = AtlasButton; i <= AtlasBag; i++) {
++            CGImageRef source = i <= AtlasKnob ? skin : actions;
++            CGRect box = i <= AtlasKnob ? skinRects[i] : CGRectMake((i - AtlasJump) * 256, 0, 256, 256);
++            CGImageRef crop = source ? CGImageCreateWithImageInRect(source, box) : NULL;
++            [images addObject:crop ? [UIImage imageWithCGImage:crop] : [UIImage new]];
++            if (crop) CGImageRelease(crop);
++        }
++        sprites = images.copy;
++    });
++    return sprites[index];
++}
++
++static CGRect around(CGPoint center, CGFloat radius) {
++    return CGRectMake(center.x - radius, center.y - radius, radius * 2, radius * 2);
++}
++
++static UIColor *shade(BOOL active) {
++    return active ? [UIColor colorWithRed:45/255.0 green:205/255.0 blue:235/255.0 alpha:120/255.0]
++                  : [UIColor colorWithRed:20/255.0 green:30/255.0 blue:33/255.0 alpha:40/255.0];
++}
++
++static UIColor *cyan(void) { return [UIColor colorWithRed:.26 green:.84 blue:.96 alpha:.86]; }
++static UIColor *ink(void) { return [UIColor colorWithRed:.94 green:.92 blue:.86 alpha:.90]; }
++
++static void disk(CGPoint center, CGFloat radius, UIColor *fill) {
++    [fill setFill];
++    [[UIBezierPath bezierPathWithOvalInRect:around(center, radius)] fill];
++}
++
++static void frame(AtlasSprite index, CGRect box, CGFloat opacity) {
++    UIImage *image = sprite(index);
++    if (image.CGImage) {
++        [image drawInRect:box blendMode:kCGBlendModeNormal alpha:opacity];
++    } else {
++        [[UIColor colorWithWhite:1 alpha:opacity] setStroke];
++        [[UIBezierPath bezierPathWithOvalInRect:CGRectInset(box, 1, 1)] stroke];
++    }
++}
++
++static void caption(NSString *label, CGPoint center, CGFloat radius) {
++    UIFont *font = [UIFont monospacedSystemFontOfSize:MAX(11, radius * .85) weight:UIFontWeightSemibold];
++    NSShadow *shadow = [NSShadow new];
++    shadow.shadowColor = [UIColor colorWithWhite:0 alpha:.65];
++    shadow.shadowOffset = CGSizeMake(0, 1);
++    shadow.shadowBlurRadius = 2;
++    NSDictionary *style = @{NSFontAttributeName:font, NSForegroundColorAttributeName:ink(), NSShadowAttributeName:shadow};
++    CGSize size = [label sizeWithAttributes:style];
++    [label drawAtPoint:CGPointMake(center.x - size.width / 2, center.y - size.height / 2) withAttributes:style];
++}
++
++static void symbol(NSString *name, CGPoint center, CGFloat size, UIColor *color) {
++    UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:size weight:UIImageSymbolWeightMedium];
++    UIImage *image = [[UIImage systemImageNamed:name withConfiguration:config] imageWithTintColor:color renderingMode:UIImageRenderingModeAlwaysOriginal];
++    [image drawAtPoint:CGPointMake(center.x - image.size.width / 2, center.y - image.size.height / 2)];
++}
++
++static void swapArrows(CGPoint center, CGFloat radius) {
++    [cyan() setStroke]; [cyan() setFill];
++    CGFloat ring = radius * .86, head = radius * .19;
++    for (int i = 0; i < 2; i++) {
++        CGFloat start = i ? .35 : 3.49, end = start + 1.60;
++        UIBezierPath *arc = [UIBezierPath bezierPathWithArcCenter:center radius:ring startAngle:start endAngle:end clockwise:YES];
++        arc.lineWidth = MAX(1.1, radius * .09);
++        [arc stroke];
++        CGFloat x = center.x + cos(end) * ring, y = center.y + sin(end) * ring;
++        UIBezierPath *arrow = [UIBezierPath bezierPath];
++        [arrow moveToPoint:CGPointMake(x - sin(end) * head, y + cos(end) * head)];
++        [arrow addLineToPoint:CGPointMake(x + cos(end) * head * .6, y + sin(end) * head * .6)];
++        [arrow addLineToPoint:CGPointMake(x - cos(end) * head * .6, y - sin(end) * head * .6)];
++        [arrow closePath];
++        [arrow fill];
++    }
++}
++
++void BOTWSheikahDrawControl(BOTWSheikahTarget target, BOTWSheikahControl control, UIImage *item, BOOL held) {
++    CGPoint center = target.center;
++    CGFloat r = target.radius;
++    disk(center, r, shade(held));
++    frame(AtlasButton, around(center, r), held ? .85 : .63);
++    int action = controls[control].action;
++    BOOL picker = control == BOTWSheikahWeapon || control == BOTWSheikahShield || control == BOTWSheikahArrows;
++    if (action >= 0 && sprite(action).CGImage) {
++        [sprite(action) drawInRect:around(center, r * .75) blendMode:kCGBlendModeNormal alpha:.92];
++    } else if (item) {
++        CGFloat size = r * (picker ? .55 : control == BOTWSheikahBow ? .57 : .72);
++        [item drawInRect:around(center, size) blendMode:kCGBlendModeNormal alpha:.94];
++    } else {
++        switch (control) {
++            case BOTWSheikahUp: symbol(@"arrow.up", center, r * .85, ink()); break;
++            case BOTWSheikahWhistle: symbol(@"arrow.down", center, r * .85, ink()); break;
++            case BOTWSheikahMap: symbol(@"map", center, r * .92, ink()); break;
++            case BOTWSheikahCancel: symbol(@"xmark", center, r * .90, [UIColor colorWithRed:.95 green:.40 blue:.32 alpha:.95]); break;
++            default: caption(controls[control].key, center, r); break;
++        }
++    }
++    if (picker) swapArrows(center, r);
++}
++
++void BOTWSheikahDrawStick(CGPoint center, CGPoint knob, CGFloat radius, BOOL held) {
++    disk(center, radius, shade(NO));
++    frame(AtlasStick, around(center, radius), .63);
++    frame(AtlasKnob, around(knob, radius * .45), held ? .68 : .42);
++}
++
++static int runeAtSlot(uint8_t owned, unsigned slot) {
++    for (int i = 0; i < 8; i++) {
++        if ((owned & (1 << i)) && slot-- == 0) return i;
++    }
++    return -1;
++}
++
++int BOTWSheikahFanPick(BOTWSheikahLayout layout, CGPoint point, uint8_t owned) {
++    unsigned count = __builtin_popcount(owned);
++    CGPoint center = layout.target[BOTWSheikahRune].center;
++    CGFloat dx = point.x - center.x, dy = point.y - center.y;
++    CGFloat distance = hypot(dx, dy);
++    if (!count || dy > 8 || distance < layout.fanInner * .70 || distance > layout.fanOuter + 2) return -1;
++    CGFloat theta = atan2(MIN(0, dy), dx);
++    if (theta > 0) theta = -M_PI;
++    unsigned slot = MIN(count - 1, (unsigned)((theta + M_PI) * count / M_PI));
++    return runeAtSlot(owned, slot);
++}
++
++void BOTWSheikahDrawFan(BOTWSheikahLayout layout, uint8_t owned, int selected, int hovered, NSDictionary<NSNumber *, UIImage *> *runes) {
++    if (!owned || layout.fanOuter <= layout.fanInner) return;
++    NSString *const symbols[] = {@"circle.fill", @"square.fill", @"u.circle.fill", @"lock.fill",
++                                 @"snowflake", @"camera.fill", @"motorcycle", @"figure.stand"};
++    CGPoint center = layout.target[BOTWSheikahRune].center;
++    unsigned count = __builtin_popcount(owned);
++    CGFloat inner = layout.fanInner, outer = layout.fanOuter, middle = (inner + outer) / 2;
++    CGFloat span = M_PI / count;
++    for (unsigned slot = 0; slot < count; slot++) {
++        int rune = runeAtSlot(owned, slot);
++        CGFloat start = -M_PI + slot * span + runeSliceInset, end = -M_PI + (slot + 1) * span - runeSliceInset;
++        UIBezierPath *slice = [UIBezierPath bezierPathWithArcCenter:center radius:outer startAngle:start endAngle:end clockwise:YES];
++        [slice addLineToPoint:CGPointMake(center.x + cos(end) * inner, center.y + sin(end) * inner)];
++        [slice addArcWithCenter:center radius:inner startAngle:end endAngle:start clockwise:NO];
++        [slice closePath];
++        [(rune == hovered ? shade(YES) : [UIColor colorWithRed:.08 green:.12 blue:.13 alpha:.59]) setFill];
++        [slice fill];
++        [(rune == selected || rune == hovered ? cyan() : [UIColor colorWithWhite:1 alpha:.55]) setStroke];
++        slice.lineWidth = rune == selected ? 1.8 : 1;
++        [slice stroke];
++        CGFloat angle = (start + end) / 2;
++        CGPoint anchor = CGPointMake(center.x + cos(angle) * middle, center.y + sin(angle) * middle);
++        CGFloat r = MIN((outer - inner) * .35, middle * span * .38);
++        UIImage *icon = runes[@(rune)];
++        if (icon) [icon drawInRect:around(anchor, r) blendMode:kCGBlendModeNormal alpha:.95];
++        else symbol(symbols[rune], anchor, r * 1.45, rune == selected ? cyan() : ink());
++    }
++}
++
++UIImage *BOTWSheikahSettingsArtwork(void) {
++    // Public archive sanitization: use a system symbol instead of a game emblem.
++    return [[UIImage systemImageNamed:@"gearshape.fill"]
++        imageWithTintColor:UIColor.systemTealColor renderingMode:UIImageRenderingModeAlwaysOriginal];
++}
+--- /dev/null
++++ b/games/totk/runtime/botw_picture.h
+@@ -0,0 +1,29 @@
++#pragma once
++#include <stddef.h>
++
++typedef enum {
++    BOTWPictureAutomatic,
++    BOTWPictureLetterbox,
++    BOTWPictureFill,
++} BOTWPictureFormat;
++
++/* A wider screen can use the game's wide camera. Narrower displays use the original camera. */
++static inline float botw_wide_screen_ratio(float ratio) {
++    return ratio > (16.0f / 9.0f) * 1.01f && ratio <= 8.0f ? ratio : 0;
++}
++
++/* Match the drawable without changing the scene's proportions. Crop only when explicitly requested. */
++static inline void botw_center_crop(size_t *x, size_t *y, size_t *w, size_t *h,
++                                    size_t out_w, size_t out_h) {
++    if (!out_w || !out_h || !*w || !*h) return;
++    if (*w * out_h > *h * out_w) {
++        size_t new_w = *h * out_w / out_h;
++        if (new_w) { *x += (*w - new_w) / 2; *w = new_w; }
++    } else {
++        size_t new_h = *w * out_h / out_w;
++        if (new_h) { *y += (*h - new_h) / 2; *h = new_h; }
++    }
++}
++
++int runtime_ios_picture_format(void);
++void runtime_ios_set_picture_format(BOTWPictureFormat format);
+--- /dev/null
++++ b/games/totk/runtime/botw_scene_resolution.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++/* Store only these row counts. Zero is the caller's sentinel for an absent or invalid preference. */
++static inline int botw_handheld_scene_rows(long saved_rows, int is_ipad) {
++    switch (saved_rows) {
++    case 540: return 540;
++    case 432: return 432;
++    case 360: return 360;
++    default: return is_ipad ? 540 : 432;
++    }
++}
++
++/* BOTW 1.6.0 on iOS. Call once before creating the host thread, with the validated preference. */
++void runtime_ios_set_boot_scene_rows(long saved_rows, int is_ipad);
++/* An actual guest drawable's Metal presentation is the quality trial's success boundary. */
++void runtime_ios_note_scene_presented(double presented_time, int interpolated);
+--- a/games/totk/third_party/d2r_gfx/gfx/nvn/fps_overlay.h
++++ b/games/totk/third_party/d2r_gfx/gfx/nvn/fps_overlay.h
+@@ -17,6 +17,9 @@
+ /* Key 1: HUD_MODE_ALL (FPS, shader collection, load and the shortcut reminder) -> HUD_MODE_MINIMAL (FPS only) -> HUD_MODE_OFF. */
+ enum { HUD_MODE_OFF = 0, HUD_MODE_ALL = 1, HUD_MODE_MINIMAL = 2 };
+ int fps_overlay_hud_mode(void);
++#if defined(GAME_BOTW160)
++int fps_overlay_set_hud_mode(int mode); /* returns 0 for invalid input; render flags still gate individual lines */
++#endif
+ int fps_overlay_hints_enabled(void);   /* the FPS readout shows (all or minimal) */
+ int fps_overlay_full_hud(void);        /* everything shows (all) */
+ int fps_overlay_toggle_hints(void);   /* atomically steps to the next mode and returns it (HUD_MODE_OFF = nothing shows) */
+@@ -51,6 +54,10 @@
+    re-measured every half second; fps_overlay_value() returns it, or -1 before the first measurement. */
+ void fps_overlay_note(uint64_t ticket, double now_s);
+ int fps_overlay_value(void);
++#if defined(GAME_BOTW160)
++void fps_overlay_note_displayed(double now_s);
++int fps_overlay_displayed_value(double now_s);
++#endif
+ /* The same for interpolated frames shown (n counts them); fps_overlay_gen_value() is that rate, or -1. */
+ void fps_overlay_note_gen(uint64_t n, double now_s);
+ int fps_overlay_gen_value(void);
+--- a/games/totk/runtime/gamepad.m
++++ b/games/totk/runtime/gamepad.m
+@@ -2,6 +2,9 @@
+ #import <Foundation/Foundation.h>
+ #import <GameController/GameController.h>
+ #include <TargetConditionals.h>
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++#import <UIKit/UIKit.h>
++#endif
+ #if TARGET_OS_OSX
+ #import <IOKit/hid/IOHIDManager.h>
+ #include <IOKit/hid/IOHIDUsageTables.h>
+@@ -21,6 +24,15 @@
+ static pthread_mutex_t gamepadLock = PTHREAD_MUTEX_INITIALIZER;
+ static RuntimeGamepadState gamepadState;
+ static uint64_t pressedEdges;
++static RuntimeGamepadState touchState;
++static uint64_t touchPressedEdges;
++static BOOL touchContinuousCamera;
++static int32_t touchCameraX, touchCameraY;
++static uint64_t touchCameraAim;
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++static uint64_t touchRuneNext, touchRunePending, touchRuneDelivered, touchRuneDeadline;
++static BOOL physicalReleaseRequired;  // gamepadLock, armed only by the HUD editor exit
++#endif
+ static BOOL started;
+ static uint16_t controllerMap[CONTROLLER_BUTTONS];
+ static uint8_t controllerModes[CONTROLLER_BUTTONS];
+@@ -456,6 +468,20 @@
+         next.rx = stronger_axis(next.rx, hidPad.rx);
+         next.ry = stronger_axis(next.ry, hidPad.ry);
+     }
++    pthread_mutex_lock(&gamepadLock);
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++    if (physicalReleaseRequired) {
++        // Observe neutral at the source, before mapped holds or latched edges are added.
++        // The sampled stick values have already gone through the normal deadzone.
++        physicalReleaseRequired = next.connected && (physical || next.lx || next.ly || next.rx || next.ry);
++        gamepadState = (RuntimeGamepadState){.connected = next.connected};
++        pressedEdges = 0;
++        gamepadRawLeftAt = 0;
++        gamepadNativeLx = gamepadNativeLy = 0;
++        pthread_mutex_unlock(&gamepadLock);
++        return;
++    }
++#endif
+     /* Modes work on the physical buttons, not on the mapped ones: two physical buttons may share a Switch button
+        (X and L3 both running), and a mapped edge would be lost while the other one is held. */
+     uint64_t now = runtime_now_ns(), edges = physical & ~physicalPrev, synthetic = 0, suppressed = 0;
+@@ -489,7 +515,6 @@
+     uint64_t held = physical & ~suppressed;
+     for (int i = 0; i < CONTROLLER_BUTTONS; i++) if (controllerModes[i] != CONTROLLER_HOLD) held &= ~(1ULL << i);
+     next.buttons |= controller_map_apply(controllerMap, held) | synthetic;
+-    pthread_mutex_lock(&gamepadLock);
+     pressedEdges |= next.buttons & ~gamepadState.buttons;
+     gamepadState = next;
+     gamepadRawLeftAt = rawAt;
+@@ -538,6 +563,15 @@
+     if (detected) *detected = found;
+     return atomic_load(&controllerType);
+ }
++
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++static void refresh_gamepads_after_focus(void) {
++    pthread_mutex_lock(&gamepadLock);
++    BOOL awaitingRelease = physicalReleaseRequired;
++    pthread_mutex_unlock(&gamepadLock);
++    if (awaitingRelease) refresh_gamepads();
++}
++#endif
+ 
+ void runtime_gamepad_start(void) {
+     if (started) return;
+@@ -556,34 +590,146 @@
+                        runtime_feedback_detach(controller);
+                        refresh_gamepads();
+                    }];
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++    [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
++                   usingBlock:^(NSNotification *notification) {
++                       (void)notification;
++                       refresh_gamepads_after_focus();
++                   }];
++#endif
+     for (GCController *controller in GCController.controllers) attach_gamepad(controller);
+     [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
+     hid_pad_start();
+ }
+ 
+-void runtime_gamepad_clear(void) {
+-    runtime_feedback_quiet();
++static void clear_gamepad_mapping(void) {
+     physicalPrev = 0;
+     memset(tapUntil, 0, sizeof tapUntil);
+     memset(toggleOn, 0, sizeof toggleOn);
+     memset(toggleMoved, 0, sizeof toggleMoved);
+-    pthread_mutex_lock(&gamepadLock);
++}
++
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++void runtime_gamepad_block_until_release(void) {
++    pthread_mutex_lock(&gamepadLock);
++    physicalReleaseRequired = YES;
++    clear_gamepad_mapping();
++    pthread_mutex_unlock(&gamepadLock);
++    // Runs on the main thread while the editor still owns Npad. Poll hardware so a
++    // focus-loss clear, or a release without a foreground event, cannot make the decision.
++    refresh_gamepads();
++}
++#endif
++
++void runtime_gamepad_clear(void) {
++    runtime_feedback_quiet();
++    pthread_mutex_lock(&gamepadLock);
++    clear_gamepad_mapping();
+     gamepadState = (RuntimeGamepadState){0};
++    touchState = (RuntimeGamepadState){0};
++    touchContinuousCamera = NO;
+     gamepadRawLeftAt = 0;
+     gamepadNativeLx = gamepadNativeLy = 0;
+     pressedEdges = 0;
++    touchPressedEdges = 0;
++    touchCameraX = touchCameraY = 0;
++    touchCameraAim = 0;
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++    touchRunePending = touchRuneDelivered = touchRuneDeadline = 0;
++#endif
+     mouse_look_reset(&mouseLook); mouseRX = mouseRY = 0;
+     pthread_mutex_unlock(&gamepadLock);
+ }
+ 
+-/* On-screen touch controls (iPhone, ios/app/Sources/touch_controls.m) feed a second state merged with the physical
++/* On-screen touch controls (iPhone, ios/Sources/touch_pad.m) feed a second state merged with the physical
+    controllers: buttons are OR-ed (a tap shorter than one game frame is latched like a controller press), each stick
+    axis takes the stronger value. */
+-static RuntimeGamepadState touchState;
+-void runtime_touch_pad_set(const RuntimeGamepadState *s) {
+-    pthread_mutex_lock(&gamepadLock);
+-    pressedEdges |= s->buttons & ~touchState.buttons;
++void runtime_touch_pad_set(const RuntimeGamepadState *s, int continuous_camera) {
++    pthread_mutex_lock(&gamepadLock);
++    touchPressedEdges |= s->buttons & ~touchState.buttons;
+     touchState = *s;
++    touchContinuousCamera = continuous_camera != 0;
++    pthread_mutex_unlock(&gamepadLock);
++}
++
++void runtime_touch_pad_clear(void) {
++    pthread_mutex_lock(&gamepadLock);
++    touchState = (RuntimeGamepadState){0};
++    touchContinuousCamera = NO;
++    touchPressedEdges = 0;
++    touchCameraX = touchCameraY = 0;
++    touchCameraAim = 0;
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++    touchRunePending = touchRuneDelivered = touchRuneDeadline = 0;
++#endif
++    pthread_mutex_unlock(&gamepadLock);
++}
++
++uint64_t runtime_touch_pad_rune_pulse(uint64_t expires_ns) {
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++    pthread_mutex_lock(&gamepadLock);
++    uint64_t token = 0;
++    if (expires_ns > runtime_now_ns()) {
++        if (!(token = ++touchRuneNext)) token = ++touchRuneNext;
++        touchRunePending = token;
++        touchRuneDeadline = expires_ns;
++    }
++    pthread_mutex_unlock(&gamepadLock);
++    return token;
++#else
++    (void)expires_ns;
++    return 0;
++#endif
++}
++
++int runtime_touch_pad_rune_pulse_result(uint64_t token) {
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++    pthread_mutex_lock(&gamepadLock);
++    int result = -1;
++    if (token && token == touchRuneDelivered) result = 1;
++    else if (token && token == touchRunePending) {
++        if (runtime_now_ns() <= touchRuneDeadline) result = 0;
++        else touchRunePending = touchRuneDeadline = 0;
++    }
++    pthread_mutex_unlock(&gamepadLock);
++    return result;
++#else
++    (void)token;
++    return -1;
++#endif
++}
++
++void runtime_touch_pad_deliver_rune_pulse(RuntimeGamepadState *state) {
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++    if (!state) return;
++    pthread_mutex_lock(&gamepadLock);
++    if (touchRunePending) {
++        if (runtime_now_ns() > touchRuneDeadline) {
++            touchRunePending = touchRuneDeadline = 0;
++        } else if (!(state->buttons & (8192u | 64u)) && !state->rx && !state->ry) {
++            state->buttons |= 64u; /* BOTW L: use the confirmed rune once. */
++            state->connected = 1;
++            touchRuneDelivered = touchRunePending;
++            touchRunePending = touchRuneDeadline = 0;
++        }
++    }
++    pthread_mutex_unlock(&gamepadLock);
++#else
++    (void)state;
++#endif
++}
++
++/* Keep the latest motion until a Npad poll, including its aim button. A released aim gets its final read before
++   another finger can replace it. Zero axes discard an unconsumed sample only from the contact being superseded. */
++void runtime_touch_pad_camera_sample(int32_t x, int32_t y, uint64_t aim) {
++    pthread_mutex_lock(&gamepadLock);
++    BOOL discard = !x && !y;
++    BOOL releasedAim = touchCameraAim && !(touchState.buttons & touchCameraAim);
++    if (discard ? aim == touchCameraAim : !releasedAim || aim == touchCameraAim) {
++        touchCameraX = x;
++        touchCameraY = y;
++        touchCameraAim = discard ? 0 : aim;
++    }
+     pthread_mutex_unlock(&gamepadLock);
+ }
+ 
+@@ -593,11 +739,20 @@
+     if (gamepadRawLeftAt && runtime_now_ns() - gamepadRawLeftAt > 250000000ULL) {
+         out->lx = gamepadNativeLx; out->ly = gamepadNativeLy;
+     }
+-    out->buttons |= touchState.buttons | pressedEdges;
++    out->buttons |= touchState.buttons | pressedEdges | touchPressedEdges | touchCameraAim;
+     out->lx = stronger_axis(out->lx, touchState.lx); out->ly = stronger_axis(out->ly, touchState.ly);
+-    out->rx = stronger_axis(out->rx, touchState.rx); out->ry = stronger_axis(out->ry, touchState.ry);
++    // Finish a queued touch aim or quick R/ZR tap on its own poll before the
++    // newly active floating stick. Hardware and picker/rune axes still merge.
++    BOOL queuedTouchAim = touchCameraAim || (touchPressedEdges & (128u | 512u));
++    if (!touchContinuousCamera || !queuedTouchAim) {
++        out->rx = stronger_axis(out->rx, touchState.rx); out->ry = stronger_axis(out->ry, touchState.ry);
++    }
++    out->rx = stronger_axis(out->rx, touchCameraX); out->ry = stronger_axis(out->ry, touchCameraY);
+     out->rx = stronger_axis(out->rx, mouseRX); out->ry = stronger_axis(out->ry, mouseRY);
+     if (touchState.connected) out->connected = 1;
+     pressedEdges = 0;
+-    pthread_mutex_unlock(&gamepadLock);
+-}
++    touchPressedEdges = 0;
++    touchCameraX = touchCameraY = 0;
++    touchCameraAim = 0;
++    pthread_mutex_unlock(&gamepadLock);
++}
+--- a/games/totk/runtime/input.c
++++ b/games/totk/runtime/input.c
+@@ -13,7 +13,14 @@
+ static pthread_mutex_t inputLock=PTHREAD_MUTEX_INITIALIZER;
+ static unsigned char keys[128];static uint64_t pending;
+ static uint32_t styles=1;static bool enabled,allowed=true;static int holdType;
+-static int64_t sample;static uint64_t padSeen;
++static int64_t sample;static uint64_t padSeen;static bool menuOpen;
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++/* A deferred tap must wait until the game has actually read a released rune picker. */
++static _Atomic uint64_t runeNeutralReads;
++uint64_t runtime_input_rune_neutral_reads(void){return atomic_load_explicit(&runeNeutralReads,memory_order_acquire);}
++#else
++uint64_t runtime_input_rune_neutral_reads(void){return 0;}
++#endif
+ /* F/T/H/G map the D-pad left/up/right/down, keeping both analog-stick mappings independent. */
+ static uint64_t button(unsigned code){switch(code){case 38:return 1;case 40:case 49:return 2;case 34:return 4;case 32:return 8;case 6:return 16;case 8:return 32;case 12:return 64;case 14:return 128;case 58:return 256;case 56:return 512;case 36:return 1024;case 48:case 53:return 2048;case 3:return 4096;case 17:return 8192;case 4:return 16384;case 5:return 32768;default:return 0;}}
+ /* Real user input (a window key, a controller button, a stick pushed past half) stops TOTK_AUTOLOAD and is logged at most
+@@ -35,7 +42,7 @@
+    PlayStation -> Switch (runtime_gamepad_type_cycle, gamepad.m). Key 7 (key code 26) turns mouse mode on / off
+    (runtime_mouse_toggle, gamepad.m; the window holds the pointer: frontend.m). Held-key repeats do not cycle. */
+ enum { KEY_INTERP_TOGGLE = 19, KEY_OUTPUT_MODE_CYCLE = 20, KEY_ASPECT_TOGGLE = 21, KEY_PAD_TYPE_CYCLE = 22, KEY_TAA_TOGGLE = 23, KEY_MOUSE_TOGGLE = 26 };   /* 21: key 4, 16:9 -> fit to the window -> 21:9 (aspect_patch.h); 22: key 6; 23: key 5, MetalFX temporal anti-aliasing (totk_taa.m) */
+-void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pthread_mutex_lock(&inputLock);int press=down&&!keys[code];if(down&&!keys[code])pending|=button(code);keys[code]=(unsigned char)!!down;pthread_mutex_unlock(&inputLock);
++void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pthread_mutex_lock(&inputLock);if(menuOpen){pthread_mutex_unlock(&inputLock);return;}int press=down&&!keys[code];if(down&&!keys[code])pending|=button(code);keys[code]=(unsigned char)!!down;pthread_mutex_unlock(&inputLock);
+  if(press&&code==18){extern void runtime_shortcut_help_toggle(void);runtime_shortcut_help_toggle();}
+  if(press&&code==KEY_INTERP_TOGGLE){extern void dm_gfx_set_flag(const char *name,int v);dm_gfx_set_flag("mfx_interp",-1);}
+  if(press&&code==KEY_OUTPUT_MODE_CYCLE)runtime_output_mode_cycle();
+@@ -45,6 +52,12 @@
+  if(press&&code==KEY_MOUSE_TOGGLE)runtime_mouse_toggle();}
+ void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
+ void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
++/* A native menu owns input while open. Flush latched edges without discarding a controller's physical state. */
++void runtime_input_set_menu_open(int open){
++ pthread_mutex_lock(&inputLock);menuOpen=!!open;memset(keys,0,sizeof(keys));pending=0;
++ RuntimeGamepadState state;runtime_gamepad_read(&state);padSeen=state.buttons;
++ pthread_mutex_unlock(&inputLock);
++}
+ static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread_mutex_unlock(&inputLock);fprintf(stderr,"[totk] native keyboard controller initialized\n");}
+ /* Docked: one full-key controller as player 1 (id 0, style bit 0). Handheld (TOTK_OPERATION_MODE=handheld, the iPhone):
+    the same input is the handheld controller (id 0x20, style bit 1, joy-cons attached) and player 1 is not connected;
+@@ -63,13 +76,26 @@
+ static int full_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,1);}
+ static int handheld_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,2);}
+ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style){if(max<=0)return 0;if(id)input_log(want_style==2?"handheld state":"full-key state",*id);if(!out||!id)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);NpadState state={.sampling=++sample};if(enabled&&allowed&&*id==pad_id()&&want_style==pad_style()&&(styles&want_style)){
+- state.attributes=1;for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;
++ state.attributes=1;
++ if(!menuOpen){
++ for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;
+  state.lx=32767*((int)keys[2]-(int)keys[0]);state.ly=32767*((int)keys[13]-(int)keys[1]);state.rx=32767*((int)keys[124]-(int)keys[123]);state.ry=32767*((int)keys[126]-(int)keys[125]);
+  RuntimeGamepadState pad;runtime_gamepad_read(&pad);state.buttons|=pad.buttons;
+  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
+  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
+  if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;
+- }*out=state;pthread_mutex_unlock(&inputLock);return 1;}
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++ RuntimeGamepadState runeGate={.buttons=state.buttons,.rx=state.rx,.ry=state.ry};
++ runtime_touch_pad_deliver_rune_pulse(&runeGate);state.buttons=runeGate.buttons;
++#endif
++ }
++ }*out=state;
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++ if(enabled&&allowed&&*id==pad_id()&&want_style==pad_style()&&(styles&want_style)&&!menuOpen&&
++    !(state.buttons&(8192u|64u))&&!state.rx&&!state.ry)
++  atomic_fetch_add_explicit(&runeNeutralReads,1,memory_order_release);
++#endif
++ pthread_mutex_unlock(&inputLock);return 1;}
+ static int disconnected_states(NpadState *out,int max,const uint32_t *id){if(id)input_log("joy-con state",*id);if(max<=0)return 0;if(!out)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);*out=(NpadState){.sampling=++sample};pthread_mutex_unlock(&inputLock);return 1;}
+ static void hold_type(int type){if(type<0||type>1)runtime_fail("invalid joy hold type");holdType=type;(void)holdType;}
+ static void disconnect(const uint32_t *id){if(!id)runtime_fail("disconnect id");input_log("disconnect",*id);if(*id==pad_id()){   /* only the pad in use: in handheld mode TOTK disconnects player 1 */pthread_mutex_lock(&inputLock);allowed=false;pthread_mutex_unlock(&inputLock);runtime_input_clear();}}
+--- a/games/totk/ios/Sources/main.m
++++ b/games/totk/ios/Sources/main.m
+@@ -5,6 +5,7 @@
+ #include <TargetConditionals.h>
+ #include <pthread.h>
+ #include <signal.h>
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+@@ -12,11 +13,161 @@
+ #include "runtime.h"
+ #include "dmsh_chain.h"
+ #import "touch_pad.h"
++#if defined(GAME_BOTW160)
++#import "BOTWCloud-Swift.h"
++#import "BOTWGraphicsSettings.h"
++#import "BOTWSheikahEditor.h"
++#import <MetalFX/MetalFX.h>
++#include "totk_mfx_up.h"
++#include "fps_overlay.h"
++#include "botw_scene_resolution.h"
++#endif
+ 
+ int totk_host_main(int argc, char **argv);
+ void runtime_ios_attach_layer(CAMetalLayer *layer, UIView *host);
+ void runtime_ios_sync_drawable(UIView *host);
+ void runtime_ios_sync_safe_area(UIView *host);
++#if defined(GAME_BOTW160)
++long runtime_ios_drawable_rows(void);
++void runtime_ios_set_drawable_rows(long rows);
++int runtime_mfx_recent(void);
++static NSString *const graphicsOutputKey = @"BOTWGraphicsOutputRows";
++static NSString *const graphicsFormatKey = @"BOTWGraphicsFormat";
++static NSString *const graphicsMetalKey = @"BOTWGraphicsMetalFX";
++static NSString *const graphicsOverlayKey = @"BOTWGraphicsOverlayMode";
++static NSString *const graphicsDockedKey = @"BOTWGraphicsDocked";
++static NSString *const graphicsDockedPendingKey = @"BOTWGraphicsDockedPending";
++static NSString *const swipeControlsKey = @"BOTWSwipeControls";
++static NSString *const graphicsSceneRowsKey = @"BOTWGraphicsSceneRows";
++static NSString *const touchCameraSensitivityKey = @"BOTWTouchCameraSensitivityPercent";
++static NSString *const floatingCameraStickKey = @"BOTWFloatingCameraStick";
++static NSString *const scenePresentedNotification = @"BOTWFirstValidScenePresentation";
++static BOOL graphicsDocked, graphicsDockedRecovered;
++
++#if TARGET_OS_IOS
++void runtime_ios_note_scene_presented(double presented_time, int interpolated) {
++    static _Atomic BOOL sent;
++    if (interpolated || !isfinite(presented_time) || presented_time <= 0 || atomic_load_explicit(&sent, memory_order_relaxed))
++        return;
++    if (atomic_exchange_explicit(&sent, YES, memory_order_relaxed)) return;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [NSNotificationCenter.defaultCenter postNotificationName:scenePresentedNotification object:nil];
++    });
++}
++#endif
++
++static double strictIntegerValue(id stored) {
++    if (![stored isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)stored) == CFBooleanGetTypeID()) return NAN;
++    double value = [stored doubleValue];
++    return isfinite(value) && trunc(value) == value ? value : NAN;
++}
++
++static long validatedSceneRows(id stored) {
++    double rows = strictIntegerValue(stored);
++    return rows == 360 || rows == 432 || rows == 540 ? (long)rows : 0;
++}
++
++static long savedSceneRows(NSUserDefaults *defaults) {
++    return validatedSceneRows([defaults objectForKey:graphicsSceneRowsKey]);
++}
++
++static BOOL commitScenePreference(NSUserDefaults *defaults, NSString *key, id value) {
++    id previous = [defaults objectForKey:key];
++    [defaults setObject:value forKey:key];
++    // A player may force-quit immediately to apply the next launch's setting.
++    if ([defaults synchronize]) return YES;
++    if (previous) [defaults setObject:previous forKey:key];
++    else [defaults removeObjectForKey:key];
++    [defaults synchronize];
++    return NO;
++}
++
++static BOOL saveSceneRows(NSUserDefaults *defaults, long rows) {
++    return commitScenePreference(defaults, graphicsSceneRowsKey, @(rows));
++}
++
++static NSString *sceneBootKey(BOOL ipad) {
++    return ipad ? @"BOTWGraphicsSceneBoot.iPad" : @"BOTWGraphicsSceneBoot.iPhone";
++}
++
++static NSDictionary *sceneBootRecord(NSUserDefaults *defaults, BOOL ipad) {
++    id record = [defaults objectForKey:sceneBootKey(ipad)];
++    return [record isKindOfClass:NSDictionary.class] ? record : @{};
++}
++
++static BOOL saveSceneBootRecord(NSUserDefaults *defaults, BOOL ipad, long confirmed, long pending) {
++    return commitScenePreference(defaults, sceneBootKey(ipad), @{@"confirmed": @(confirmed), @"pending": @(pending)});
++}
++
++static BOOL stageSceneRows(NSUserDefaults *defaults, BOOL ipad, long rows) {
++    NSDictionary *record = sceneBootRecord(defaults, ipad);
++    if (validatedSceneRows(record[@"pending"]) == rows) {
++        // An explicit retry makes a matching interrupted trial eligible again. Leave
++        // the next choice alone unless the old marker has been durably cleared.
++        long confirmed = botw_handheld_scene_rows(validatedSceneRows(record[@"confirmed"]), ipad);
++        if (!saveSceneBootRecord(defaults, ipad, confirmed, 0)) return NO;
++        if (savedSceneRows(defaults) == rows) return YES;
++    }
++    return saveSceneRows(defaults, rows);
++}
++
++typedef struct {
++    long rawRows, blockedRows;
++    BOOL confirmOnFirstFrame, recovered, commitFailed;
++} SceneLaunchChoice;
++
++static SceneLaunchChoice prepareSceneLaunch(NSUserDefaults *defaults, BOOL ipad, BOOL docked) {
++    long desired = savedSceneRows(defaults);
++    if (docked) return (SceneLaunchChoice){.rawRows = desired};
++    NSDictionary *record = sceneBootRecord(defaults, ipad);
++    long confirmed = botw_handheld_scene_rows(validatedSceneRows(record[@"confirmed"]), ipad);
++    long pending = validatedSceneRows(record[@"pending"]);
++    if (pending && pending == desired && pending != confirmed) {
++        // Put the working choice back first. If that write fails, retaining the old
++        // pending marker makes the next launch choose the safe base again.
++        BOOL restored = saveSceneRows(defaults, confirmed);
++        BOOL cleared = restored && saveSceneBootRecord(defaults, ipad, confirmed, 0);
++        return (SceneLaunchChoice){.rawRows = confirmed, .blockedRows = restored ? 0 : pending,
++                                   .recovered = YES, .commitFailed = !cleared};
++    }
++    if (desired && desired != confirmed) {
++        if (saveSceneBootRecord(defaults, ipad, confirmed, desired))
++            return (SceneLaunchChoice){.rawRows = desired, .confirmOnFirstFrame = YES};
++        return (SceneLaunchChoice){.rawRows = confirmed, .blockedRows = desired, .commitFailed = YES};
++    }
++    long active = botw_handheld_scene_rows(desired, ipad);
++    return (SceneLaunchChoice){.rawRows = desired, .confirmOnFirstFrame = active != confirmed || pending != 0};
++}
++
++static BOTWSceneQuality sceneQualityForRows(long rows) {
++    if (rows == 360) return BOTWSceneQualityFaster;
++    if (rows == 432) return BOTWSceneQualityBalanced;
++    return BOTWSceneQualitySharper;
++}
++
++static NSInteger savedTouchCameraSensitivity(NSUserDefaults *defaults) {
++    double percent = strictIntegerValue([defaults objectForKey:touchCameraSensitivityKey]);
++    return percent >= 75 && percent <= 200 ? BOTWTouchCameraSensitivityNormalize((NSInteger)percent)
++                                          : BOTWTouchCameraSensitivityDefault;
++}
++
++static BOOL savedFloatingCameraStick(NSUserDefaults *defaults) {
++    id stored = [defaults objectForKey:floatingCameraStickKey];
++    return [stored isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)stored) == CFBooleanGetTypeID()
++        ? [stored boolValue] : YES;
++}
++
++static BOOL metalFXSupported(void) {
++    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++    return device && [MTLFXSpatialScalerDescriptor supportsMetal4FX:device];
++}
++
++static void setGraphicsMetalFX(BOOL on) {
++    mfxup_set(on);
++    mfxup_output_set(on);
++}
++#endif
++
+ static char *host_argv[3];
+ static NSString *g_no_game_data;   // set when there is no RomFS image to play from (didFinishLaunching)
+ static NSString *g_seed_pack, *g_seed_unpack_to;   // a pushed shader pack to unpack before the game starts (seed_unpack)
+@@ -81,11 +232,43 @@
+ - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; runtime_ios_sync_safe_area(self); }   // the HUD boxes keep out of the notch
+ @end
+ 
+-@interface TOTKGameController : UIViewController @property(nonatomic,strong) TOTKMetalView *gameView; @end
++#if defined(GAME_BOTW160)
++@interface TOTKSheikahEditorController : UIViewController
++@end
++@implementation TOTKSheikahEditorController
++- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
++@end
++
++@interface TOTKGameController : UIViewController <BOTWGraphicsSettingsDelegate, UIPopoverPresentationControllerDelegate>
++#else
++@interface TOTKGameController : UIViewController
++#endif
++@property(nonatomic,strong) TOTKMetalView *gameView;
++#if defined(GAME_BOTW160)
++@property(nonatomic,strong) TOTKTouchPad *touchPad;
++@property(nonatomic,strong) UIButton *graphicsButton;
++@property(nonatomic,strong) UIButton *extraControlsButton;
++@property(nonatomic) BOOL graphicsOpen;
++@property(nonatomic) BOOL openingSheikahEditor;
++@property(nonatomic,strong) BOTWSheikahEditor *sheikahEditor;
++@property(nonatomic,copy) NSDictionary<NSNumber *, UIImage *> *sheikahEditorIcons;
++@property(nonatomic) CGSize lastTouchSize;
++@property(nonatomic) long sceneRowsAtLaunch;
++@property(nonatomic) SceneLaunchChoice sceneLaunchChoice;
++#endif
++@end
+ @implementation TOTKGameController
+ - (void)viewDidLoad {
+     [super viewDidLoad];
+     self.view.backgroundColor = UIColor.blackColor;
++#if defined(GAME_BOTW160)
++    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
++    NSNumber *rows = [defaults objectForKey:graphicsOutputKey];
++    if ([rows isKindOfClass:NSNumber.class]) runtime_ios_set_drawable_rows(rows.longValue);
++    NSNumber *format = [defaults objectForKey:graphicsFormatKey];
++    if ([format isKindOfClass:NSNumber.class] && format.integerValue >= BOTWPictureAutomatic &&
++        format.integerValue <= BOTWPictureFill) runtime_ios_set_picture_format((BOTWPictureFormat)format.integerValue);
++#endif
+     self.gameView = [[TOTKMetalView alloc] initWithFrame:self.view.bounds];
+     self.gameView.autoresizingMask = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+ #if TARGET_OS_VISION
+@@ -96,8 +279,364 @@
+ #endif
+     [self.view addSubview:self.gameView];
+     runtime_ios_attach_layer((CAMetalLayer *)self.gameView.layer, self.gameView);
+-    TOTKTouchPad *pad=[[TOTKTouchPad alloc] initWithFrame:self.view.bounds];pad.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;[self.view addSubview:pad];
+-}
++    TOTKTouchPad *pad = [[TOTKTouchPad alloc] initWithFrame:self.view.bounds];
++    pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
++    [self.view addSubview:pad];
++#if defined(GAME_BOTW160)
++    self.touchPad = pad;
++    self.touchPad.swipeLayout = self.supportsSwipeControls && [defaults boolForKey:swipeControlsKey];
++    if (self.supportsTouchCamera) {
++        self.touchPad.touchCameraSensitivity = savedTouchCameraSensitivity(defaults);
++        self.touchPad.floatingCameraStick = self.supportsSwipeControls && savedFloatingCameraStick(defaults);
++    }
++    self.touchPad.sheikahOverrides = BOTWSheikahLoadLayout(defaults);
++    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
++    button.translatesAutoresizingMaskIntoConstraints = NO;
++    button.tintColor = UIColor.whiteColor;
++    button.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.75];
++    button.layer.cornerRadius = 22;
++    [button setImage:[UIImage systemImageNamed:@"gearshape"
++        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium]]
++        forState:UIControlStateNormal];
++    button.accessibilityLabel = self.supportsTouchCamera ? @"Настройки" : @"Настройки графики";
++    button.hidden = YES;
++    [button addTarget:self action:@selector(openGraphicsSettings) forControlEvents:UIControlEventTouchUpInside];
++    self.graphicsButton = button;
++    [self.view addSubview:button];
++    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
++    [NSLayoutConstraint activateConstraints:@[
++        [button.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
++        [button.topAnchor constraintEqualToAnchor:safe.topAnchor constant:BOTWSheikahSettingsTop],
++        [button.widthAnchor constraintEqualToConstant:BOTWSheikahSettingsSize],
++        [button.heightAnchor constraintEqualToConstant:BOTWSheikahSettingsSize]
++    ]];
++    if (self.supportsSwipeControls) {
++        UIButton *extra = [UIButton buttonWithType:UIButtonTypeSystem];
++        extra.translatesAutoresizingMaskIntoConstraints = NO;
++        extra.tintColor = button.tintColor;
++        extra.layer.cornerRadius = 22;
++        [extra setImage:[UIImage systemImageNamed:@"ellipsis"
++            withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium]]
++            forState:UIControlStateNormal];
++        [extra addTarget:self action:@selector(toggleExtraControls) forControlEvents:UIControlEventTouchUpInside];
++        self.extraControlsButton = extra;
++        [self.view addSubview:extra];
++        [NSLayoutConstraint activateConstraints:@[
++            [extra.leadingAnchor constraintEqualToAnchor:button.trailingAnchor constant:6],
++            [extra.topAnchor constraintEqualToAnchor:button.topAnchor],
++            [extra.widthAnchor constraintEqualToAnchor:button.widthAnchor],
++            [extra.heightAnchor constraintEqualToAnchor:button.heightAnchor]
++        ]];
++        [self updateExtraControlsButton];
++    }
++    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(firstPresentedFrame:)
++                                              name:@"BOTWFirstPresentedFrame" object:nil];
++    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(firstValidScenePresentation:)
++                                              name:scenePresentedNotification object:nil];
++#endif
++}
++#if defined(GAME_BOTW160)
++- (BOOL)supportsSwipeControls {
++    return TARGET_OS_IOS && self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
++}
++
++- (BOOL)supportsTouchCamera {
++    return TARGET_OS_IOS && (self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPhone ||
++                             self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPad);
++}
++
++- (void)viewDidLayoutSubviews {
++    [super viewDidLayoutSubviews];
++    runtime_ios_sync_drawable(self.gameView);
++    CGSize size = self.touchPad.bounds.size;
++    if (!CGSizeEqualToSize(size, self.lastTouchSize)) {
++        self.lastTouchSize = size;
++        [self.touchPad releaseTouches];
++    }
++}
++
++- (void)firstPresentedFrame:(NSNotification *)notification {
++    self.graphicsButton.hidden = self.sheikahEditor != nil;
++    [self updateExtraControlsButton];
++    if (graphicsDocked) {
++        [NSUserDefaults.standardUserDefaults removeObjectForKey:graphicsDockedPendingKey];
++        [NSUserDefaults.standardUserDefaults synchronize];
++    }
++}
++
++- (void)firstValidScenePresentation:(NSNotification *)notification {
++    (void)notification;
++    SceneLaunchChoice choice = self.sceneLaunchChoice;
++    if (choice.confirmOnFirstFrame) {
++        BOOL ipad = self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPad;
++        BOOL confirmed = saveSceneBootRecord(NSUserDefaults.standardUserDefaults, ipad, self.sceneRowsAtLaunch, 0);
++        choice.confirmOnFirstFrame = !confirmed;
++        choice.commitFailed = !confirmed;
++        self.sceneLaunchChoice = choice;
++    }
++}
++
++- (void)updateExtraControlsButton {
++    BOOL sheikah = self.supportsSwipeControls && self.touchPad.swipeLayout;
++    UIImage *art = sheikah ? [TOTKTouchPad sheikahSettingsArtwork] :
++        [UIImage systemImageNamed:@"gearshape"
++            withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium]];
++    [self.graphicsButton setImage:art forState:UIControlStateNormal];
++    self.graphicsButton.backgroundColor = sheikah ? UIColor.clearColor : [UIColor colorWithWhite:0.08 alpha:0.75];
++    // Every game control is available in the Sheikah layout; no separate overflow is needed.
++    self.extraControlsButton.hidden = YES;
++}
++
++- (void)toggleExtraControls {
++    if (!self.touchPad.swipeLayout || self.graphicsOpen) return;
++    self.touchPad.extraControls = !self.touchPad.extraControls;
++    [self updateExtraControlsButton];
++}
++
++- (void)openGraphicsSettings {
++    if (self.graphicsOpen || self.presentedViewController || !self.view.window) return;
++    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
++    BOTWGraphicsSettings *settings = [BOTWGraphicsSettings new];
++    settings.delegate = self;
++    settings.outputRows = runtime_ios_drawable_rows();
++    settings.sceneQualitySupported = self.supportsTouchCamera;
++    if (settings.sceneQualitySupported) {
++        BOOL ipad = self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPad;
++        SceneLaunchChoice choice = self.sceneLaunchChoice;
++        long nextRows = savedSceneRows(defaults);
++        if (choice.blockedRows && nextRows == choice.blockedRows) nextRows = self.sceneRowsAtLaunch;
++        settings.sceneQualityCurrent = sceneQualityForRows(self.sceneRowsAtLaunch);
++        settings.sceneQualityNext = sceneQualityForRows(botw_handheld_scene_rows(nextRows, ipad));
++        settings.sceneQualityRecovered = choice.recovered;
++        settings.sceneQualityCommitFailed = choice.commitFailed;
++    }
++    settings.touchCameraSupported = self.supportsTouchCamera;
++    settings.touchCameraSensitivity = self.touchPad.touchCameraSensitivity;
++    settings.floatingCameraSupported = self.supportsSwipeControls;
++    settings.floatingCameraStick = self.touchPad.floatingCameraStick;
++    int format = runtime_ios_picture_format();
++    settings.format = format < 0 ? BOTWPictureAutomatic : (BOTWPictureFormat)format;
++    settings.metalFXSupported = metalFXSupported();
++    settings.metalFX = settings.metalFXSupported && mfxup_enabled();
++    settings.overlayMode = fps_overlay_hud_mode();
++    settings.overlayForcedOff = !fps_overlay_enabled();
++    settings.dockedCurrent = graphicsDocked;
++    settings.dockedNext = [defaults boolForKey:graphicsDockedKey];
++    settings.dockedRecovered = graphicsDockedRecovered;
++    settings.showsTouchSettings = self.supportsSwipeControls;
++    settings.swipeControls = self.touchPad.swipeLayout;
++
++    UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:settings];
++    navigation.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
++    navigation.view.backgroundColor = BOTWGraphicsPanelBackground();
++    UINavigationBarAppearance *appearance = [UINavigationBarAppearance new];
++    [appearance configureWithOpaqueBackground];
++    appearance.backgroundColor = BOTWGraphicsPanelBackground();
++    appearance.titleTextAttributes = @{NSForegroundColorAttributeName: UIColor.whiteColor};
++    navigation.navigationBar.tintColor = [UIColor colorWithRed:0.65 green:0.82 blue:1 alpha:1];
++    navigation.navigationBar.standardAppearance = appearance;
++    navigation.navigationBar.scrollEdgeAppearance = appearance;
++    navigation.navigationBar.compactAppearance = appearance;
++    navigation.modalPresentationStyle = UIModalPresentationPopover;
++    CGSize safeSize = self.view.safeAreaLayoutGuide.layoutFrame.size;
++    BOOL phone = self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
++    navigation.preferredContentSize = CGSizeMake(MIN(phone ? 700 : 450, safeSize.width - 32),
++                                                 MIN(phone ? 520 : 620, safeSize.height - 64));
++    UIPopoverPresentationController *popover = navigation.popoverPresentationController;
++    popover.sourceView = self.graphicsButton;
++    popover.sourceRect = self.graphicsButton.bounds;
++    popover.permittedArrowDirections = UIPopoverArrowDirectionUp;
++#if !TARGET_OS_VISION
++    popover.backgroundColor = BOTWGraphicsPanelBackground();
++#endif
++    popover.delegate = self;
++
++    self.graphicsOpen = YES;
++    runtime_input_set_menu_open(1);
++    self.sheikahEditorIcons = [self.touchPad sheikahEditorIcons];
++    [self.touchPad releaseTouches];
++    self.touchPad.userInteractionEnabled = NO;
++    [self updateExtraControlsButton];
++    [self presentViewController:navigation animated:YES completion:^{
++        navigation.presentationController.delegate = self;
++    }];
++}
++
++- (void)graphicsSetMetalFX:(BOOL)on {
++    setGraphicsMetalFX(on);
++    [NSUserDefaults.standardUserDefaults setBool:on forKey:graphicsMetalKey];
++}
++
++- (void)graphicsSetOutputRows:(long)rows {
++    runtime_ios_set_drawable_rows(rows);
++    [NSUserDefaults.standardUserDefaults setInteger:rows forKey:graphicsOutputKey];
++    runtime_ios_sync_drawable(self.gameView);
++}
++
++- (BOOL)graphicsSetSceneQualityForNextLaunch:(BOTWSceneQuality)quality {
++    if (!self.supportsTouchCamera) return NO;
++    long rows;
++    switch (quality) {
++    case BOTWSceneQualityFaster: rows = 360; break;
++    case BOTWSceneQualityBalanced: rows = 432; break;
++    case BOTWSceneQualitySharper: rows = 540; break;
++    default: return NO;
++    }
++    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
++    BOOL ipad = self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPad;
++    SceneLaunchChoice choice = self.sceneLaunchChoice;
++    long pending = validatedSceneRows(sceneBootRecord(defaults, ipad)[@"pending"]);
++    // The old boot overlay event can make Settings available before a valid
++    // drawable. Re-selecting this live trial must keep its recovery marker.
++    BOOL currentTrial = choice.confirmOnFirstFrame && !choice.commitFailed &&
++        pending == rows && self.sceneRowsAtLaunch == rows;
++    BOOL saved = currentTrial ? saveSceneRows(defaults, rows) : stageSceneRows(defaults, ipad, rows);
++    if (!saved) return NO;
++    choice.blockedRows = 0;
++    // A successful selection clears a previous save/recovery warning. Keep an
++    // unresolved confirmation for the current live trial if its marker remains.
++    choice.commitFailed = choice.commitFailed && choice.confirmOnFirstFrame &&
++        validatedSceneRows(sceneBootRecord(defaults, ipad)[@"pending"]) == self.sceneRowsAtLaunch;
++    self.sceneLaunchChoice = choice;
++    return YES;
++}
++
++- (BOOL)graphicsSceneQualitySaveWarning {
++    return self.sceneLaunchChoice.commitFailed;
++}
++
++- (void)settingsSetTouchCameraSensitivity:(NSInteger)percent {
++    if (!self.supportsTouchCamera || BOTWTouchCameraSensitivityNormalize(percent) != percent) return;
++    self.touchPad.touchCameraSensitivity = percent;
++    [NSUserDefaults.standardUserDefaults setInteger:percent forKey:touchCameraSensitivityKey];
++}
++
++- (void)settingsSetFloatingCameraStick:(BOOL)enabled {
++    if (!self.supportsSwipeControls) return;
++    self.touchPad.floatingCameraStick = enabled;
++    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:floatingCameraStickKey];
++}
++
++- (void)graphicsSetFormat:(BOTWPictureFormat)format {
++    runtime_ios_set_picture_format(format);
++    [NSUserDefaults.standardUserDefaults setInteger:format forKey:graphicsFormatKey];
++}
++
++- (void)graphicsSetDocked:(BOOL)docked {
++    [NSUserDefaults.standardUserDefaults setBool:docked forKey:graphicsDockedKey];
++}
++
++- (void)settingsSetSwipeControls:(BOOL)enabled {
++    if (!self.supportsSwipeControls || self.touchPad.swipeLayout == enabled) return;
++    self.touchPad.extraControls = NO;
++    self.touchPad.swipeLayout = enabled;
++    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:swipeControlsKey];
++    [self updateExtraControlsButton];
++}
++
++- (void)settingsEditSheikahLayout {
++    UIViewController *menu = self.presentedViewController;
++    if (!self.graphicsOpen || !self.touchPad.swipeLayout || !menu || self.openingSheikahEditor || self.sheikahEditor) return;
++    self.openingSheikahEditor = YES;
++    // Keep the existing native menu input gate closed throughout the UIKit dismissal.
++    [menu dismissViewControllerAnimated:NO completion:^{
++        self.openingSheikahEditor = NO;
++        if (!self.view.window) { [self graphicsDidDismiss]; return; }
++        self.touchPad.hidden = YES;
++        self.graphicsButton.hidden = YES;
++        NSDictionary<NSNumber *, UIImage *> *icons = self.sheikahEditorIcons;
++        __weak typeof(self) weakSelf = self;
++        BOTWSheikahEditor *editor = [[BOTWSheikahEditor alloc] initWithFrame:self.view.bounds
++            overrides:self.touchPad.sheikahOverrides
++            icon:^UIImage *(BOTWSheikahControl control) { return icons[@(control)]; }
++            completion:^(BOTWSheikahOverrides *saved) { [weakSelf finishSheikahEditor:saved]; }];
++        self.sheikahEditor = editor;
++        // iCloud already defers resume alerts while a native controller is presented.
++        TOTKSheikahEditorController *screen = [TOTKSheikahEditorController new];
++        screen.view = editor;
++        screen.modalPresentationStyle = UIModalPresentationOverFullScreen;
++        screen.modalInPresentation = YES;
++        [self presentViewController:screen animated:NO completion:^{
++            [self setNeedsUpdateOfSupportedInterfaceOrientations];
++            [screen setNeedsUpdateOfSupportedInterfaceOrientations];
++            UIAccessibilityPostNotification(UIAccessibilityScreenChangedNotification, nil);
++        }];
++    }];
++}
++
++- (void)finishSheikahEditor:(BOTWSheikahOverrides *)saved {
++    if (!self.sheikahEditor) return;
++    if (saved) {
++        if (!BOTWSheikahSaveLayout(NSUserDefaults.standardUserDefaults, saved)) {
++            [self.sheikahEditor showSaveFailure];
++            return;
++        }
++        self.touchPad.sheikahOverrides = saved;
++    }
++    [self dismissViewControllerAnimated:NO completion:^{
++#if TARGET_OS_IOS
++        runtime_gamepad_block_until_release();
++#endif
++        self.sheikahEditor = nil;
++        self.touchPad.hidden = NO;
++        self.graphicsButton.hidden = NO;
++        [self graphicsDidDismiss];
++        UIAccessibilityPostNotification(UIAccessibilityScreenChangedNotification, self.graphicsButton);
++    }];
++}
++
++- (BOOL)graphicsSetOverlayMode:(int)mode {
++    if (!fps_overlay_enabled() || !fps_overlay_set_hud_mode(mode)) return NO;
++    [NSUserDefaults.standardUserDefaults setInteger:mode forKey:graphicsOverlayKey];
++    return YES;
++}
++
++- (NSInteger)graphicsDisplayedFPS {
++    return fps_overlay_displayed_value(CACurrentMediaTime());
++}
++
++- (NSString *)graphicsMetalStatus {
++    if (!mfxup_enabled()) return @"Меняется сразу. MetalFX меняет алгоритм масштабирования, когда это позволяет размер изображения.";
++    if (runtime_mfx_recent()) return @"Масштабирование MetalFX применялось в последних кадрах.";
++    return @"Включено. Применяется, когда размер кадра и видеоустройство позволяют масштабирование.";
++}
++
++- (void)graphicsDidDismiss {
++    if (self.openingSheikahEditor || self.sheikahEditor) return;
++    if (self.graphicsOpen) {
++        self.sheikahEditorIcons = nil;
++        self.graphicsOpen = NO;
++        [self.touchPad releaseTouches];
++        self.touchPad.userInteractionEnabled = YES;
++        runtime_input_set_menu_open(0);
++        [self updateExtraControlsButton];
++    }
++    if (!self.presentedViewController) [BOTWCloudController completeDeferredResume];
++}
++
++- (void)graphicsSettingsClosed {
++    UIViewController *menu = self.presentedViewController;
++    if (menu) {
++        [menu dismissViewControllerAnimated:YES completion:^{ [self graphicsDidDismiss]; }];
++    } else {
++        [self graphicsDidDismiss];
++    }
++}
++
++- (void)graphicsSettingsDidDismiss {
++    [self graphicsDidDismiss];
++}
++
++- (void)presentationControllerDidDismiss:(UIPresentationController *)presentationController {
++    [self graphicsDidDismiss];
++}
++
++- (UIModalPresentationStyle)adaptivePresentationStyleForPresentationController:(UIPresentationController *)controller
++                                                               traitCollection:(UITraitCollection *)traits {
++    return UIModalPresentationNone;
++}
++#endif
++
+ - (void)viewDidAppear:(BOOL)animated {
+     [super viewDidAppear:animated];
+     static BOOL started; if (started) return; started = YES;
+@@ -129,6 +668,31 @@
+     [self startGame];
+ }
+ - (void)startGame {
++#if defined(GAME_BOTW160)
++    NSString *profile = [NSString stringWithUTF8String:getenv("TOTK_PROFILE_DIR")];
++    [BOTWCloudController prepareWithPresenter:self profile:profile completion:^{ [self startNativeGame]; }];
++#else
++    [self startNativeGame];
++#endif
++}
++- (void)startNativeGame {
++#if defined(GAME_BOTW160)
++    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
++    id savedOverlay = [defaults objectForKey:graphicsOverlayKey];
++    if ([savedOverlay isKindOfClass:NSNumber.class] &&
++        CFGetTypeID((__bridge CFTypeRef)savedOverlay) != CFBooleanGetTypeID()) {
++        NSNumber *value = savedOverlay;
++        int mode = value.intValue;
++        if ([value isEqualToNumber:@(mode)]) fps_overlay_set_hud_mode(mode);
++    }
++    NSNumber *metal = [defaults objectForKey:graphicsMetalKey];
++    if ([metal isKindOfClass:NSNumber.class]) setGraphicsMetalFX(metal.boolValue && metalFXSupported());
++    else { (void)mfxup_enabled(); (void)mfxup_output_enabled(); }
++    if (graphicsDocked) {
++        [defaults setBool:YES forKey:graphicsDockedPendingKey];
++        [defaults synchronize];
++    }
++#endif
+     /* Playback category (PR #97): plays with the ring / silent switch off and routes to the speaker. Without an active
+        session the game's CoreAudio output stays on a null sink on iOS 27 ("no device sink in use"); activating it in
+        didFinishLaunching blocked the main thread before the log file was opened. Interruptions: audio_observe. */
+@@ -139,6 +703,16 @@
+     fprintf(stderr, "[totk-audio] audio session category=%s active=%d route=%s err=%s%s\n",
+             audio.category.UTF8String ?: "?", (int)activated, audio.currentRoute.outputs.firstObject.portType.UTF8String ?: "?",
+             catErr ? catErr.localizedDescription.UTF8String : "none", actErr ? actErr.localizedDescription.UTF8String : "");
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++    if (self.supportsTouchCamera) {
++        BOOL ipad = self.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPad;
++        SceneLaunchChoice choice = prepareSceneLaunch(NSUserDefaults.standardUserDefaults, ipad, graphicsDocked);
++        self.sceneLaunchChoice = choice;
++        long rows = choice.rawRows;
++        self.sceneRowsAtLaunch = botw_handheld_scene_rows(rows, ipad);
++        runtime_ios_set_boot_scene_rows(rows, ipad);
++    }
++#endif
+     pthread_attr_t attr; pthread_attr_init(&attr); pthread_attr_setstacksize(&attr, 64u << 20);
+     pthread_t thread; pthread_create(&thread, &attr, run_host, NULL);
+     pthread_detach(thread); pthread_attr_destroy(&attr);
+@@ -152,6 +726,13 @@
+    _UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption at launch), so the window belongs to a window scene. */
+ @interface TOTKSceneDelegate : UIResponder <UIWindowSceneDelegate> @property(nonatomic,strong) UIWindow *window; @end
+ @implementation TOTKSceneDelegate
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++- (void)windowScene:(UIWindowScene *)windowScene didUpdateEffectiveGeometry:(UIWindowSceneGeometry *)previousGeometry {
++    if (windowScene.effectiveGeometry.interfaceOrientation == previousGeometry.interfaceOrientation) return;
++    TOTKGameController *game = (TOTKGameController *)self.window.rootViewController;
++    [game.touchPad releaseTouches];
++}
++#endif
+ - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options {
+     (void)session; (void)options;
+     if (![scene isKindOfClass:UIWindowScene.class]) return;
+@@ -275,7 +856,20 @@
+     setenv("TOTK_MFX_UPSCALE","0",0);
+     setenv("TOTK_FPS_OVERLAY","0",0);
+ #else
++#if defined(GAME_BOTW160)
++    NSUserDefaults *graphicsDefaults = NSUserDefaults.standardUserDefaults;
++    graphicsDocked = [graphicsDefaults boolForKey:graphicsDockedKey];
++    if ([graphicsDefaults boolForKey:graphicsDockedPendingKey]) {
++        graphicsDockedRecovered = graphicsDocked;
++        graphicsDocked = NO;
++        [graphicsDefaults setBool:NO forKey:graphicsDockedKey];
++        [graphicsDefaults removeObjectForKey:graphicsDockedPendingKey];
++        [graphicsDefaults synchronize];
++    }
++    setenv("TOTK_OPERATION_MODE",graphicsDocked ? "docked" : "handheld",1);
++#else
+     setenv("TOTK_OPERATION_MODE","handheld",1);
++#endif
+ #endif
+     // Game language: the Settings app (Settings.bundle › TOTK_LANG) stores the choice in our defaults; empty means the
+     // system language, which is what the runtime already follows. iOS 27 does not honour Info.plist LSEnvironment, so
+--- a/games/totk/runtime/runtime.h
++++ b/games/totk/runtime/runtime.h
+@@ -122,12 +122,18 @@
+ 
+ void runtime_input_key(unsigned code,int down);
+ void runtime_input_clear(void);
++/* BOTW iOS: number of delivered neutral rune-picker Npad samples (0 on other targets). */
++uint64_t runtime_input_rune_neutral_reads(void);
++void runtime_input_set_menu_open(int open);
+ int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
+ void *runtime_input_override(const char *name);
+ typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;
+ void runtime_gamepad_start(void);
+ void runtime_gamepad_switch_left(void *controller, int x, int y);
+ void runtime_gamepad_read(RuntimeGamepadState *out);
++/* BOTW iOS editor exit, on the main thread while Npad is still gated: discard physical
++   edges and wait for a fresh neutral/disconnected sample. Touch and keyboard stay independent. */
++void runtime_gamepad_block_until_release(void);
+ /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
+    the background, so a button held at focus loss would otherwise stay pressed for the game. */
+ void runtime_gamepad_clear(void);
+@@ -139,7 +145,13 @@
+ void runtime_mouse_move(double dx, double dy);      /* points, AppKit's deltaX / deltaY (down positive) */
+ void runtime_mouse_button(int button, int down);    /* main thread; 0 left, 1 right, 2 middle, 3 and 4 the side buttons */
+ void runtime_mouse_release(void);                   /* main thread: buttons up, stick centred */
+-void runtime_touch_pad_set(const RuntimeGamepadState *state);   /* on-screen touch controls (iOS) */
++void runtime_touch_pad_set(const RuntimeGamepadState *state, int continuous_camera);   /* on-screen touch controls (iOS) */
++void runtime_touch_pad_camera_sample(int32_t x, int32_t y, uint64_t aim);   /* one sample, or discard a matching aim when axes are zero */
++void runtime_touch_pad_clear(void);                            /* cancel touch axes and unconsumed touch presses */
++/* Deferred rune tap: one poll before the monotonic deadline, or cancellation/expiry. */
++uint64_t runtime_touch_pad_rune_pulse(uint64_t expires_ns);
++int runtime_touch_pad_rune_pulse_result(uint64_t token);       /* 1 delivered, 0 pending, -1 cancelled or expired */
++void runtime_touch_pad_deliver_rune_pulse(RuntimeGamepadState *state); /* called only for an active Npad result */
+ /* Controller rumble and motion (opt-in TOTK_RUMBLE=1 / TOTK_GYRO=1): the game's hid side in runtime/hid_feedback.c, the
+    Mac controller's haptics and motion sensors in runtime/gamepad_feedback.m. */
+ #define RUNTIME_MOTION_MAX 32
+--- a/games/totk/ios/Sources/touch_pad.h
++++ b/games/totk/ios/Sources/touch_pad.h
+@@ -1,6 +1,20 @@
+ #import <UIKit/UIKit.h>
++#import "BOTWSheikahHUD.h"
++
++enum { BOTWTouchCameraSensitivityDefault = 100 };
++FOUNDATION_EXPORT NSInteger BOTWTouchCameraSensitivityNormalize(NSInteger value);
+ 
+ /* On-screen controller for iPhone/iPad, laid out like a Switch controller. It reports its state to the runtime through
+    runtime_touch_pad_set (runtime/gamepad.m), which merges it with any physical controller. */
+ @interface TOTKTouchPad : UIView
++@property(nonatomic) BOOL swipeLayout;
++// Sheikah only. Classic continues to draw its two existing sticks.
++@property(nonatomic) BOOL floatingCameraStick;
++// Applies to free touch camera control. Aim buttons and hardware keep their own response.
++@property(nonatomic) NSInteger touchCameraSensitivity;
++@property(nonatomic) BOOL extraControls;
++@property(nonatomic, copy) BOTWSheikahOverrides *sheikahOverrides;
++- (NSDictionary<NSNumber *, UIImage *> *)sheikahEditorIcons;
+++ (UIImage *)sheikahSettingsArtwork;
++- (void)releaseTouches;
+ @end
+--- a/games/totk/ios/Sources/touch_pad.m
++++ b/games/totk/ios/Sources/touch_pad.m
+@@ -1,38 +1,125 @@
+ #import "touch_pad.h"
++#import "BOTWSheikahHUD.h"
+ #import <GameController/GameController.h>
+ #include <math.h>
++#include <stdlib.h>
++#include <string.h>
+ #include "runtime.h"
+-
+-/* Layout inside the safe area (clear of the iPhone's notch, rounded corners and home indicator), like a Switch
+-   controller: ZL/L and R/ZR along the top with − and + between them, and two columns mirroring each other: on the left
+-   the d-pad above the left stick, on the right A/B/X/Y above the camera stick. Each stick is drawn at its resting place
+-   until a finger takes it; the sticks sit a little toward the middle. L3 / R3 (stick press) are in the bottom corners,
+-   under ZL / ZR.
+-   A touch that misses every button is a stick, centred where the finger went down: the left stick on the left half,
+-   the camera (right stick) on the right half. Bits are the Npad buttons. While a game controller is connected the layer
+-   is hidden; a touch shows it and works as usual, and it hides again 3 seconds after the last finger lifts. */
+-typedef struct { CGPoint at; uint64_t bit; NSString *label; CGFloat size; } TouchButton;
++#if defined(GAME_BOTW160)
++#include "botw_touch.h"
++#include <os/log.h>
++#include <stdatomic.h>
++#include <stdio.h>
++
++typedef struct {
++    unsigned polls, selectedKnown, selectedUnknown, unknownUnclassified;
++    unsigned ownedKnown, equipmentKnown, artMissing;
++    unsigned unknownReasons[BOTW_TOUCH_REASON_COUNT];
++} BOTWTouchHUDCounters;
++#endif
++
++/* The Classic layout mirrors a Switch controller. The Sheikah layout uses the artwork and
++   gameplay gestures from BOTWRecompAndroid. In either mode, the production runtime merges
++   these touch inputs with physical controller inputs. Connected controllers can hide the
++   overlay after a touch-free interval. */
++typedef struct {
++    CGPoint at;
++    uint64_t bit;
++    NSString *label;
++    CGFloat size;
++} TouchButton;
+ enum { kButtonCount = 16 };
++enum { kTouchAimThrow = 128, kTouchAimBow = 512, kTouchAimMask = kTouchAimThrow | kTouchAimBow };
+ static const CGFloat kButtonSize = 46;
+ static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger lifts, with a controller connected
+ 
++NSInteger BOTWTouchCameraSensitivityNormalize(NSInteger value) {
++    if (value >= 75 && value <= 200 && value % 25 == 0) return value;
++    return BOTWTouchCameraSensitivityDefault;
++}
++
++@interface BOTWSheikahAccessibilityButton : UIAccessibilityElement
++@property(nonatomic, copy) BOOL (^activate)(void);
++@end
++
++@implementation BOTWSheikahAccessibilityButton
++- (BOOL)accessibilityActivate { return self.activate ? self.activate() : NO; }
++@end
++
++@interface BOTWSheikahPickerTouch : NSObject
++@property(nonatomic, strong) id contact;
++@property(nonatomic) CGPoint origin, position;
++@property(nonatomic) uint64_t button;
++@end
++
++@implementation BOTWSheikahPickerTouch
++@end
++
+ @implementation TOTKTouchPad {
+-    NSMapTable<UITouch *, NSValue *> *points;
+-    NSMapTable<UITouch *, NSValue *> *leftOrigins;    // where each left-stick touch went down
+-    NSMapTable<UITouch *, NSValue *> *rightOrigins;   // the same for the camera stick
+-    BOOL gamepad, concealed;                          // a controller is connected; the layer is hidden for it
+-    NSTimer *hideTimer;
++    NSMapTable<id, NSNumber *> *buttonTouches;
++    NSMapTable<id, NSValue *> *aimTouches;
++    id leftOwner, rightOwner, freeLookOwner;
++    CGPoint leftOrigin, leftPosition, rightOrigin, rightPosition, freeLookOrigin, freeLookPosition;
++    CGPoint floatingCameraOrigin;
++    NSMutableArray<BOTWSheikahPickerTouch *> *pickerTouches;
++    id runeOwner, bufferedRuneOwner;
++    CGPoint runePosition, bufferedRuneOrigin;
++    CFTimeInterval bufferedRuneDownAt, bufferedRuneTapAt, runeNeutralUntil, runeConfirmAfter;
++    uint64_t runeNeutralReads, runePulseToken;
++    NSString *runeHint;
++    int runeTarget;
++    BOOL runeCommitReading;
++    BOOL runeHeld, runeFallback, runeGoal, runeChecking, preferNativeRuneWheel;
++    NSUInteger runeGeneration;
++    int fanSelection, fanCurrent, runeSteps, flickDirection;
++    uint8_t fanOwned;
++    CGFloat wheelAnchor;
++    CFTimeInterval runeSince, flickEnd, flickNext, wheelRelease, runeRetryUntil;
++    CGFloat cameraDX, cameraDY;
++    CFTimeInterval cameraTickAt;
++    uint64_t touchButtons;
++    BOOL gamepad, concealed;
++    CGRect _customLayoutArea;
++    BOTWSheikahLayout _customLayout;
++    BOOL _customLayoutCached;
++    NSTimer *hideTimer, *cameraTimer, *runeTimer;
++#if defined(GAME_BOTW160)
++    BOTWTouchSnapshot hudSnapshot;
++    NSDictionary<NSString *, UIImage *> *hudIcons;
++    NSDictionary<NSNumber *, UIImage *> *runeIcons;
++    NSTimer *hudTimer;
++    dispatch_queue_t hudQueue;
++    NSCache<NSString *, UIImage *> *iconCache;
++    NSMutableDictionary<NSString *, NSNumber *> *iconRetries;
++    BOOL hudInFlight, hudForeground;
++    BOTWTouchHUDCounters hudDiagnosticCounters;  // hudQueue only
++#endif
+ }
+ 
+ - (instancetype)initWithFrame:(CGRect)frame {
+     if ((self = [super initWithFrame:frame])) {
+-        self.multipleTouchEnabled = YES; self.backgroundColor = UIColor.clearColor; self.contentMode = UIViewContentModeRedraw;
+-        points = [NSMapTable strongToStrongObjectsMapTable];
+-        leftOrigins = [NSMapTable strongToStrongObjectsMapTable];
+-        rightOrigins = [NSMapTable strongToStrongObjectsMapTable];
++        _touchCameraSensitivity = BOTWTouchCameraSensitivityDefault;
++        self.multipleTouchEnabled = YES;
++#if defined(GAME_BOTW160)
++        hudSnapshot.selected_rune = -1;
++        hudForeground = YES;
++        hudQueue = dispatch_queue_create("org.macnativegames.botw.touch-hud", DISPATCH_QUEUE_SERIAL);
++        iconCache = [NSCache new];
++        iconCache.countLimit = 64;
++        iconRetries = [NSMutableDictionary new];
++#endif
++        self.opaque = NO;
++        self.backgroundColor = UIColor.clearColor;
++        self.contentMode = UIViewContentModeRedraw;
++        buttonTouches = [NSMapTable strongToStrongObjectsMapTable];
++        aimTouches = [NSMapTable strongToStrongObjectsMapTable];
++        pickerTouches = [NSMutableArray new];
++        runeTarget = -1;
+         NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+         [center addObserver:self selector:@selector(controllersChanged:) name:GCControllerDidConnectNotification object:nil];
+         [center addObserver:self selector:@selector(controllersChanged:) name:GCControllerDidDisconnectNotification object:nil];
++        [center addObserver:self selector:@selector(lostFocus:) name:UIApplicationWillResignActiveNotification object:nil];
++        [center addObserver:self selector:@selector(gainedFocus:) name:UIApplicationDidBecomeActiveNotification object:nil];
+         [self controllersChanged:nil];
+     }
+     return self;
+@@ -44,27 +131,180 @@
+         if (controller.extendedGamepad && !([note.name isEqualToString:GCControllerDidDisconnectNotification] && controller == note.object)) connected = YES;
+     if (connected == gamepad) return;
+     gamepad = connected; [hideTimer invalidate]; hideTimer = nil;
+-    if (gamepad) [self conceal]; else { concealed = NO; [self setNeedsDisplay]; }
++    if (gamepad && !self.extraControls) [self conceal];
++    else { concealed = NO; [self setNeedsDisplay]; }
+ }
+ 
+ - (void)conceal {
+     concealed = YES;
+     // Fingers on the screen when it hides would otherwise hold their buttons and sticks.
+-    [points removeAllObjects]; [leftOrigins removeAllObjects]; [rightOrigins removeAllObjects]; [self updateState];
++    [self releaseTouches];
++}
++
++- (void)releaseTouches {
++    [buttonTouches removeAllObjects];
++    [aimTouches removeAllObjects];
++    leftOwner = rightOwner = freeLookOwner = nil;
++    [pickerTouches removeAllObjects];
++    runeOwner = nil;
++    [self clearBufferedRune];
++    runePulseToken = 0;
++    runeHint = nil;
++    runeHeld = runeFallback = runeGoal = runeChecking = preferNativeRuneWheel = NO;
++    runeGeneration++;
++    fanSelection = fanCurrent = -1;
++    fanOwned = 0;
++    runeSteps = flickDirection = 0;
++    runeSince = flickEnd = flickNext = wheelRelease = runeRetryUntil = 0;
++    [runeTimer invalidate]; runeTimer = nil;
++    touchButtons = 0;
++    [self stopCamera];
++    runtime_touch_pad_clear();
++    [self setNeedsDisplay];
++}
++
++- (void)lostFocus:(NSNotification *)notification {
++    (void)notification;
++#if defined(GAME_BOTW160)
++    hudForeground = NO;
++    [self updateHUDPolling];
++#endif
++    [self releaseTouches];
++    [self hideLater];
++}
++
++- (void)gainedFocus:(NSNotification *)notification {
++    (void)notification;
++#if defined(GAME_BOTW160)
++    hudForeground = YES;
++    [self updateHUDPolling];
++#endif
++}
++
++- (void)didMoveToWindow {
++    [super didMoveToWindow];
++    if (!self.window) [self releaseTouches];
++#if defined(GAME_BOTW160)
++    [self updateHUDPolling];
++#endif
++}
++
++- (void)dealloc {
++    [cameraTimer invalidate];
++    [hideTimer invalidate];
++    [runeTimer invalidate];
++#if defined(GAME_BOTW160)
++    [hudTimer invalidate];
++#endif
++}
++
++- (void)setSwipeLayout:(BOOL)swipeLayout {
++    if (_swipeLayout == swipeLayout) return;
++    _swipeLayout = swipeLayout;
++    [self releaseTouches];
++#if defined(GAME_BOTW160)
++    [self updateHUDPolling];
++#endif
++}
++
++- (void)setFloatingCameraStick:(BOOL)floatingCameraStick {
++    if (_floatingCameraStick == floatingCameraStick) return;
++    _floatingCameraStick = floatingCameraStick;
++    [self releaseTouches];
++    [self hideLater];
++}
++
++- (void)setTouchCameraSensitivity:(NSInteger)touchCameraSensitivity {
++    NSInteger normalized = BOTWTouchCameraSensitivityNormalize(touchCameraSensitivity);
++    if (_touchCameraSensitivity == normalized) return;
++    _touchCameraSensitivity = normalized;
++    [self releaseTouches];
++    [self hideLater];
++}
++
++- (void)setExtraControls:(BOOL)extraControls {
++    if (_extraControls == extraControls) return;
++    _extraControls = extraControls;
++    concealed = NO;
++    [self setNeedsDisplay];
++    [self hideLater];
++}
++
+++ (UIImage *)sheikahSettingsArtwork { return BOTWSheikahSettingsArtwork(); }
++
++- (void)setUserInteractionEnabled:(BOOL)enabled {
++    if (self.userInteractionEnabled == enabled) return;
++    [super setUserInteractionEnabled:enabled];
++    if (!enabled) [self releaseTouches];
++#if defined(GAME_BOTW160)
++    [self updateHUDPolling];
++#endif
++}
++
++- (void)setHidden:(BOOL)hidden {
++    if (self.hidden == hidden) return;
++    [super setHidden:hidden];
++    if (hidden) [self releaseTouches];
++}
++
++- (BOOL)hasTouches {
++    return leftOwner || rightOwner || freeLookOwner || runeOwner || runeGoal || runeChecking || runeNeutralUntil || runePulseToken ||
++           buttonTouches.count || pickerTouches.count;
+ }
+ 
+ - (void)hideLater {
+     [hideTimer invalidate]; hideTimer = nil;
+-    if (!gamepad || points.count) return;
++    if (!gamepad || self.extraControls || self.hasTouches) return;
+     __weak TOTKTouchPad *weakSelf = self;
+     hideTimer = [NSTimer scheduledTimerWithTimeInterval:kHideAfter repeats:NO block:^(NSTimer *timer) {
+         (void)timer; TOTKTouchPad *pad = weakSelf; if (pad) [pad concealIfIdle];
+     }];
+ }
+-- (void)concealIfIdle { if (gamepad && !points.count) [self conceal]; }
++- (void)concealIfIdle { if (gamepad && !self.extraControls && !self.hasTouches) [self conceal]; }
+ 
+ - (CGRect)area { return UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); }
+-- (CGFloat)stickRadius { return MIN(70, self.area.size.height * .16); }
++
++- (void)setSheikahOverrides:(BOTWSheikahOverrides *)sheikahOverrides {
++    if ([_sheikahOverrides isEqualToDictionary:sheikahOverrides]) return;
++    _sheikahOverrides = [sheikahOverrides copy];
++    _customLayoutCached = NO;
++    [self releaseTouches];
++}
++
++- (BOTWSheikahLayout)sheikahLayout {
++    CGRect area = self.area;
++    if (!self.sheikahOverrides.count) return BOTWSheikahLayoutMake(area);
++    if (!_customLayoutCached || !CGRectEqualToRect(_customLayoutArea, area)) {
++        _customLayoutArea = area;
++        _customLayout = BOTWSheikahLayoutCanSave(area, self.sheikahOverrides)
++            ? BOTWSheikahLayoutApply(area, self.sheikahOverrides) : BOTWSheikahLayoutMake(area);
++        _customLayoutCached = YES;
++    }
++    return _customLayout;
++}
++
++- (CGFloat)stickRadius {
++    return self.swipeLayout ? self.sheikahLayout.stickRadius : MIN(70, self.area.size.height * .16);
++}
++
++- (CGFloat)floatingCameraRadius { return BOTWSheikahLayoutMake(self.area).stickRadius * .83; }
++
++- (BOOL)showsFloatingCameraStick {
++    return self.swipeLayout && self.floatingCameraStick && freeLookOwner && rightOwner == freeLookOwner &&
++           !pickerTouches.count && !(touchButtons & kTouchAimMask) &&
++           !runeHeld && !runeGoal && !runeChecking && !runeNeutralUntil && !runePulseToken;
++}
++
++- (NSDictionary<NSNumber *, UIImage *> *)sheikahEditorIcons {
++    NSMutableDictionary<NSNumber *, UIImage *> *images = [NSMutableDictionary new];
++#if defined(GAME_BOTW160)
++    for (BOTWSheikahControl control = 0; control < BOTWSheikahControlCount; control++) {
++        UIImage *image = [self iconForControl:control];
++        if (image) images[@(control)] = image;
++    }
++#endif
++    return images.copy;
++}
+ /* Distance between the centre of a button diamond (A/B/X/Y, the d-pad) and each of its buttons. */
+ - (CGFloat)diamond { return MIN(52, self.area.size.height * .14); }
+ - (CGFloat)hitRadius { return MIN(36, self.diamond * .68); }
+@@ -85,8 +325,14 @@
+     return (side + self.area.size.width * .05 - kButtonSize / 2) / 2;
+ }
+ - (CGPoint)restingStick:(BOOL)right {
+-    CGRect a = self.area; CGFloat inset = self.columnInset + self.stickRadius * 1.9;
++    CGRect a = self.area;
++    CGFloat inset = self.columnInset + self.stickRadius * 1.9;
+     return CGPointMake(right ? CGRectGetMaxX(a) - inset : CGRectGetMinX(a) + inset, CGRectGetMinY(a) + a.size.height * .80);
++}
++
++static int aimPriority(uint64_t bit) { return bit == kTouchAimBow ? 2 : bit == kTouchAimThrow ? 1 : 0; }
++static BOOL isPicker(BOTWSheikahControl control) {
++    return control == BOTWSheikahWeapon || control == BOTWSheikahShield || control == BOTWSheikahArrows;
+ }
+ 
+ - (void)buttons:(TouchButton *)b {
+@@ -103,50 +349,815 @@
+     for (int i = 0; i < kButtonCount; i++) b[i] = all[i];
+ }
+ 
+-- (uint64_t)buttonAt:(CGPoint)p {
+-    TouchButton b[kButtonCount]; [self buttons:b]; CGFloat hit = self.hitRadius; uint64_t bits = 0;
+-    for (int i = 0; i < kButtonCount; i++) if (hypot(p.x - b[i].at.x, p.y - b[i].at.y) < MIN(hit, b[i].size * .75)) bits |= b[i].bit;
++- (uint64_t)buttonAt:(CGPoint)point {
++    TouchButton buttons[kButtonCount];
++    [self buttons:buttons];
++    CGFloat hit = self.hitRadius;
++    uint64_t bits = 0;
++    for (int i = 0; i < kButtonCount; i++) {
++        TouchButton button = buttons[i];
++        if (hypot(point.x - button.at.x, point.y - button.at.y) < MIN(hit, button.size * .75))
++            bits |= button.bit;
++    }
+     return bits;
+ }
+ 
+ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int32_t *y) {
++    if (radius <= 0) { *x = *y = 0; return; }
+     CGFloat dx = to.x - from.x, dy = from.y - to.y, dist = hypot(dx, dy);
+     if (dist > radius) { dx *= radius / dist; dy *= radius / dist; }
+     *x = (int32_t)(dx / radius * 32767); *y = (int32_t)(dy / radius * 32767);
+ }
+ 
+-- (void)updateState {
+-    RuntimeGamepadState s = {.connected = 1}; CGFloat radius = self.stickRadius;
+-    for (UITouch *t in points.keyEnumerator) {
+-        CGPoint p = [points objectForKey:t].CGPointValue; NSValue *left = [leftOrigins objectForKey:t], *right = [rightOrigins objectForKey:t];
+-        if (left) stick_axes(left.CGPointValue, p, radius, &s.lx, &s.ly);
+-        else if (right) stick_axes(right.CGPointValue, p, radius, &s.rx, &s.ry);
+-        else s.buttons |= [self buttonAt:p];
+-    }
+-    runtime_touch_pad_set(&s); [self setNeedsDisplay];
++static void floating_camera_axes(CGPoint origin, CGPoint point, CGFloat radius, CGFloat gain, int32_t *x, int32_t *y) {
++    CGFloat dx = point.x - origin.x, dy = origin.y - point.y;
++    CGFloat distance = hypot(dx, dy);
++    CGFloat deadzone = radius * .16;
++    if (radius <= 0 || !isfinite(distance) || distance <= deadzone) { *x = *y = 0; return; }
++    CGFloat throwLength = MIN(1, (distance - deadzone) / (radius - deadzone) * gain);
++    *x = (int32_t)(32767 * throwLength * (dx / distance));
++    *y = (int32_t)(32767 * throwLength * (dy / distance));
++}
++
++- (void)publishState {
++    RuntimeGamepadState state = {.connected = 1, .buttons = touchButtons};
++    BOOL floating = [self showsFloatingCameraStick];
++    CGFloat cameraGain = self.touchCameraSensitivity / 100.0;
++    // A finger can stay down while a picker or aim control owns the camera. Resume
++    // around its current position so the previous tilt cannot reappear on release.
++    if (self.floatingCameraStick && !floating) floatingCameraOrigin = freeLookPosition;
++    if (leftOwner) stick_axes(leftOrigin, leftPosition, self.stickRadius, &state.lx, &state.ly);
++    if (rightOwner && !self.swipeLayout) {
++        CGFloat gain = touchButtons & kTouchAimMask ? 1 : cameraGain;
++        stick_axes(rightOrigin, rightPosition, self.stickRadius / gain, &state.rx, &state.ry);
++    } else if (self.swipeLayout && (runeFallback || runeGoal)) {
++        state.buttons |= BOTWSheikahButton(BOTWSheikahUp);
++        if (CACurrentMediaTime() < flickEnd) state.rx = flickDirection * 32767;
++    } else if (pickerTouches.count && !fanOwned) {
++        BOTWSheikahPickerTouch *picker = pickerTouches.firstObject;
++        CGPoint origin = freeLookOwner ? freeLookOrigin : picker.origin;
++        CGPoint position = freeLookOwner ? freeLookPosition : picker.position;
++        CGFloat dx = position.x - origin.x;
++        CGFloat deadzone = self.stickRadius * .07;
++        if (fabs(dx) > deadzone)
++            state.rx = copysign(MIN(32767, (fabs(dx) - deadzone) / MAX(1, self.stickRadius * .63) * 32767), dx);
++    } else if (floating) {
++        // Unlike a swipe pulse, the virtual stick stays tilted until the finger moves
++        // or lifts. The runtime publishes the same axes on every game poll.
++        floating_camera_axes(floatingCameraOrigin, freeLookPosition, self.floatingCameraRadius, cameraGain, &state.rx, &state.ry);
++    }
++    runtime_touch_pad_set(&state, floating);
++}
++
++- (void)contactsChanged {
++    touchButtons = 0;
++    for (BOTWSheikahPickerTouch *picker in pickerTouches) touchButtons |= picker.button;
++    for (NSNumber *bits in buttonTouches.objectEnumerator) touchButtons |= bits.unsignedLongLongValue;
++    [self publishState];
++    [self setNeedsDisplay];
++}
++
++#if defined(GAME_BOTW160)
++static UIImage *copyHUDIcon(NSString *actor) {
++    BOTWTouchIcon decoded;
++    if (!botw_touch_icon(actor.UTF8String, &decoded)) return nil;
++    size_t length = (size_t)decoded.width * decoded.height * 4;
++    NSData *pixels = [NSData dataWithBytesNoCopy:decoded.rgba length:length freeWhenDone:YES];
++    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)pixels);
++    if (!provider) return nil;
++    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
++    CGImageRef image = CGImageCreate(decoded.width, decoded.height, 8, 32, decoded.width * 4,
++                                     space, kCGImageAlphaLast | kCGBitmapByteOrder32Big,
++                                     provider, NULL, true, kCGRenderingIntentDefault);
++    UIImage *result = image ? [UIImage imageWithCGImage:image] : nil;
++    if (image) CGImageRelease(image);
++    CGColorSpaceRelease(space);
++    CGDataProviderRelease(provider);
++    return result;
++}
++
++static BOOL hudDiagnosticEnabled(void) {
++    static BOOL enabled;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        const char *setting = getenv("TOTK_HUD_DIAGNOSTICS");
++        enabled = setting && !strcmp(setting, "1");
++    });
++    return enabled;
++}
++
++static void emitHUDDiagnostic(BOTWTouchHUDCounters counts) {
++    static atomic_bool pending;
++    if (atomic_exchange_explicit(&pending, true, memory_order_relaxed)) return;
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++        static const char *const names[BOTW_TOUCH_REASON_COUNT] = {
++            [BOTW_TOUCH_RUNTIME_UNAVAILABLE] = "runtime_unavailable",
++            [BOTW_TOUCH_MODULE_SLOT] = "module_slot",
++            [BOTW_TOUCH_MODULE_BUSY] = "module_busy",
++            [BOTW_TOUCH_MEMORY_BUSY] = "memory_busy",
++            [BOTW_TOUCH_LOCK_ERROR] = "lock_error",
++            [BOTW_TOUCH_DATA_RANGE] = "data_range",
++            [BOTW_TOUCH_DATA_UNMAPPED] = "data_unmapped",
++            [BOTW_TOUCH_DATA_MOVED] = "data_moved",
++            [BOTW_TOUCH_VM_COPY] = "vm_copy",
++            [BOTW_TOUCH_GDT_LAYOUT] = "gdt_layout",
++            [BOTW_TOUCH_FLAG_TYPE] = "flag_type",
++            [BOTW_TOUCH_FLAG_MISSING] = "flag_missing",
++            [BOTW_TOUCH_SELECTION_RANGE] = "selection_range",
++            [BOTW_TOUCH_UNSTABLE] = "unstable",
++        };
++        char text[512];
++        int used = snprintf(text, sizeof text,
++                            "polls=%u selected_known=%u selected_unknown=%u unknown_unclassified=%u"
++                            " owned_known=%u equipment_known=%u art_missing=%u",
++                            counts.polls, counts.selectedKnown, counts.selectedUnknown, counts.unknownUnclassified,
++                            counts.ownedKnown, counts.equipmentKnown, counts.artMissing);
++        for (unsigned i = 0; i < BOTW_TOUCH_REASON_COUNT && used >= 0 && (size_t)used < sizeof text; i++)
++            used += snprintf(text + used, sizeof text - (size_t)used, " unknown_%s=%u", names[i], counts.unknownReasons[i]);
++        os_log_t logger = os_log_create("org.macnativegames.botw", "sheikah-rune");
++        os_log_with_type(logger, OS_LOG_TYPE_DEFAULT, "[botw-hud] %{public}s", text);
++        atomic_store_explicit(&pending, false, memory_order_relaxed);
++    });
++}
++
++static void countHUDDiagnostic(BOTWTouchHUDCounters *counts, uint32_t reasons, bool selectedKnown,
++                               bool ownedKnown, bool equipmentKnown, bool artMissing) {
++    counts->polls++;
++    counts->ownedKnown += ownedKnown;
++    counts->equipmentKnown += equipmentKnown;
++    if (selectedKnown) {
++        counts->selectedKnown++;
++        counts->artMissing += artMissing;
++    } else {
++        counts->selectedUnknown++;
++        counts->unknownUnclassified += !reasons;
++        for (unsigned i = 0; i < BOTW_TOUCH_REASON_COUNT; i++) counts->unknownReasons[i] += !!(reasons & (1u << i));
++    }
++}
++
++- (void)recordHUDDiagnosticReasons:(uint32_t)reasons selectedKnown:(BOOL)selectedKnown
++                        ownedKnown:(BOOL)ownedKnown equipmentKnown:(BOOL)equipmentKnown artMissing:(BOOL)artMissing {
++    BOTWTouchHUDCounters *counts = &hudDiagnosticCounters;
++    countHUDDiagnostic(counts, reasons, selectedKnown, ownedKnown, equipmentKnown, artMissing);
++    if (counts->polls == 16) {
++        emitHUDDiagnostic(*counts);
++        *counts = (BOTWTouchHUDCounters){0};
++    }
++}
++
++- (void)readHUD {
++    if (hudInFlight) return;
++    hudInFlight = YES;
++    NSCache<NSString *, UIImage *> *cache = iconCache;
++    NSMutableDictionary<NSString *, NSNumber *> *retries = iconRetries;
++    __weak typeof(self) weakSelf = self;
++    dispatch_async(hudQueue, ^{
++        BOTWTouchSnapshot snapshot = {.selected_rune = -1};
++        BOOL diagnostics = hudDiagnosticEnabled();
++        uint32_t reasons = 0;
++        if (diagnostics) botw_touch_snapshot_diagnostic(&snapshot, &reasons);
++        else botw_touch_snapshot(&snapshot);
++        NSMutableSet<NSString *> *actors = [NSMutableSet setWithObject:@"Obj_DRStone_Get"];
++        if (snapshot.equipment_known) {
++            for (unsigned i = 0; i < 4; i++) {
++                NSString *name = @(snapshot.equipped[i]);
++                if (name.length) [actors addObject:name];
++            }
++        }
++        NSMutableDictionary<NSNumber *, NSString *> *runeActors = [NSMutableDictionary dictionary];
++        for (unsigned i = 0; i < 8; i++) {
++            if ((snapshot.owned_runes_known && (snapshot.owned_runes & (1 << i))) || snapshot.selected_rune == (int)i) {
++                const char *actor = botw_touch_rune_actor(i);
++                if (actor) { [actors addObject:@(actor)]; runeActors[@(i)] = @(actor); }
++            }
++        }
++        for (NSString *actor in retries.allKeys) if (![actors containsObject:actor]) [retries removeObjectForKey:actor];
++        CFTimeInterval now = CACurrentMediaTime();
++        NSMutableDictionary<NSString *, UIImage *> *available = [NSMutableDictionary dictionary];
++        for (NSString *actor in actors) {
++            UIImage *image = [cache objectForKey:actor];
++            if (!image && now >= retries[actor].doubleValue) {
++                image = copyHUDIcon(actor);
++                if (image) {
++                    [cache setObject:image forKey:actor];
++                    [retries removeObjectForKey:actor];
++                } else retries[actor] = @(now + 2);
++            }
++            if (image) available[actor] = image;
++        }
++        NSMutableDictionary<NSNumber *, UIImage *> *availableRunes = [NSMutableDictionary dictionary];
++        for (NSNumber *rune in runeActors) {
++            UIImage *image = available[runeActors[rune]];
++            if (image) availableRunes[rune] = image;
++        }
++        dispatch_async(dispatch_get_main_queue(), ^{
++            [weakSelf applyHUD:snapshot items:available.copy runes:availableRunes.copy];
++        });
++        if (diagnostics)
++            [weakSelf recordHUDDiagnosticReasons:reasons selectedKnown:snapshot.selected_rune >= 0
++                                       ownedKnown:snapshot.owned_runes_known equipmentKnown:snapshot.equipment_known
++                                       artMissing:snapshot.selected_rune >= 0 && !availableRunes[@(snapshot.selected_rune)]];
++    });
++}
++
++- (void)applyHUD:(BOTWTouchSnapshot)snapshot items:(NSDictionary<NSString *, UIImage *> *)items
++           runes:(NSDictionary<NSNumber *, UIImage *> *)runes {
++    hudInFlight = NO;
++    if (!hudTimer) return;
++    if (!memcmp(&snapshot, &hudSnapshot, sizeof snapshot) && [items isEqualToDictionary:hudIcons]) return;
++    hudSnapshot = snapshot;
++    hudIcons = items;
++    runeIcons = runes;
++    [self setNeedsDisplay];
++}
++
++- (void)updateHUDPolling {
++    BOOL active = self.swipeLayout && self.window && self.userInteractionEnabled && hudForeground;
++    if (!active) {
++        [hudTimer invalidate]; hudTimer = nil;
++        hudSnapshot = (BOTWTouchSnapshot){.selected_rune = -1};
++        hudIcons = nil;
++        runeIcons = nil;
++        [self setNeedsDisplay];
++        return;
++    }
++    if (hudTimer) return;
++    __weak typeof(self) weakSelf = self;
++    hudTimer = [NSTimer timerWithTimeInterval:.5 repeats:YES block:^(NSTimer *timer) {
++        (void)timer;
++        [weakSelf readHUD];
++    }];
++    [NSRunLoop.mainRunLoop addTimer:hudTimer forMode:NSRunLoopCommonModes];
++    [self readHUD];
++}
++
++- (UIImage *)iconForControl:(BOTWSheikahControl)control {
++    int equippedSlot = -1;
++    switch (control) {
++        case BOTWSheikahWeapon:
++            equippedSlot = touchButtons & BOTWSheikahButton(BOTWSheikahBow) ? 1 : 0;
++            break;
++        case BOTWSheikahAttack: equippedSlot = 0; break;
++        case BOTWSheikahBow: equippedSlot = 1; break;
++        case BOTWSheikahBlock:
++        case BOTWSheikahShield: equippedSlot = 2; break;
++        case BOTWSheikahArrows: equippedSlot = 3; break;
++        case BOTWSheikahRune: return runeIcons[@(hudSnapshot.selected_rune)];
++        case BOTWSheikahSlate: return hudIcons[@"Obj_DRStone_Get"];
++        default: break;
++    }
++    return equippedSlot >= 0 && hudSnapshot.equipment_known ? hudIcons[@(hudSnapshot.equipped[equippedSlot])] : nil;
++}
++#endif
++
++// The Android control uses a 280 ms hold, a 110 ms tilt and a matching neutral gap.
++// Hold Up while stepping the game’s picker so the game, rather than this overlay, commits the selection.
++static const CFTimeInterval kRuneHold = .280, kRuneFlick = .110, kWheelSettle = .250;
++
++- (void)clearBufferedRune {
++    bufferedRuneOwner = nil;
++    bufferedRuneDownAt = bufferedRuneTapAt = runeNeutralUntil = runeConfirmAfter = 0;
++    runeNeutralReads = 0;
++    runeCommitReading = NO;
++    runeTarget = -1;
++}
++
++- (void)pulseRune {
++    touchButtons |= BOTWSheikahButton(BOTWSheikahRune);
++    [self publishState]; // Runtime latches the edge for the next Npad sample.
++}
++
++- (void)showRuneHint:(NSString *)message {
++    runeHint = message;
++    runeRetryUntil = CACurrentMediaTime() + 1.8;
++    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, message);
++    __weak typeof(self) weakSelf = self;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++        [weakSelf setNeedsDisplay];
++    });
++    [self setNeedsDisplay];
++}
++
++#if defined(GAME_BOTW160)
++- (void)pollBufferedRunePulse {
++    if (!runePulseToken) return;
++    int result = runtime_touch_pad_rune_pulse_result(runePulseToken);
++    if (!result) return;
++    runePulseToken = 0;
++    if (result < 0) [self showRuneHint:@"Нажми руну ещё раз"];
++    if (self.floatingCameraStick) [self contactsChanged];
++    [self hideLater];
++}
++
++- (void)awaitBufferedRuneAfterNeutral:(CFTimeInterval)now {
++    if (runeTarget < 0) return;
++    if (!bufferedRuneOwner && !bufferedRuneTapAt) { [self clearBufferedRune]; return; }
++    runeNeutralReads = runtime_input_rune_neutral_reads();
++    runeNeutralUntil = now + .32;
++    if (self.floatingCameraStick) [self contactsChanged];
++    [self startRuneTimer];
++}
++
++- (void)sendBufferedRuneAt:(CFTimeInterval)now {
++    if (!runeNeutralUntil) return;
++    if (now >= runeNeutralUntil || (bufferedRuneTapAt && now - bufferedRuneTapAt > 2.5)) {
++        BOOL hadTap = bufferedRuneTapAt != 0;
++        [self clearBufferedRune];
++        if (hadTap) [self showRuneHint:@"Выбери руну снова"];
++        if (self.floatingCameraStick) [self contactsChanged];
++        [self hideLater];
++        return;
++    }
++    if (!bufferedRuneTapAt || runeCommitReading || now < runeConfirmAfter ||
++        runtime_input_rune_neutral_reads() == runeNeutralReads) return;
++
++    runeCommitReading = YES;
++    NSUInteger generation = runeGeneration;
++    int target = runeTarget;
++    __weak typeof(self) weakSelf = self;
++    dispatch_async(hudQueue, ^{
++        BOTWTouchSnapshot snapshot = {.selected_rune = -1};
++        botw_touch_snapshot(&snapshot);
++        dispatch_async(dispatch_get_main_queue(), ^{
++            [weakSelf finishBufferedRune:generation target:target snapshot:snapshot];
++        });
++    });
++}
++
++- (void)finishBufferedRune:(NSUInteger)generation target:(int)target snapshot:(BOTWTouchSnapshot)snapshot {
++    if (generation != runeGeneration || !runeNeutralUntil || runeTarget != target) return;
++    runeCommitReading = NO;
++    CFTimeInterval now = CACurrentMediaTime();
++    if (now >= runeNeutralUntil || now - bufferedRuneTapAt > 2.5) return;
++    if (snapshot.selected_rune != target || !snapshot.owned_runes_known || !(snapshot.owned_runes & (1u << target))) {
++        runeConfirmAfter = now + .04;
++        return;
++    }
++    [self clearBufferedRune];
++    // A stalled game can resume much later. The runtime consumes this edge at most once before its deadline.
++    runePulseToken = runtime_touch_pad_rune_pulse(runtime_now_ns() + 125000000ull);
++    if (!runePulseToken) [self showRuneHint:@"Нажми руну ещё раз"];
++    [self contactsChanged];
++    [self hideLater];
++}
++#endif
++
++- (void)runeTickAt:(CFTimeInterval)now {
++    BOOL changed = NO, goalClosed = NO;
++    if (runeOwner && !runeHeld && now - runeSince >= kRuneHold) {
++        runeHeld = changed = YES;
++        [self interruptCamera];
++#if defined(GAME_BOTW160)
++        int rune = hudSnapshot.selected_rune;
++        if (!preferNativeRuneWheel && hudSnapshot.owned_runes_known && rune >= 0 && rune < 8 &&
++            (hudSnapshot.owned_runes & (1 << rune))) {
++            fanOwned = hudSnapshot.owned_runes;
++            fanCurrent = rune;
++        }
++#endif
++        preferNativeRuneWheel = NO;
++        if (fanOwned) fanSelection = BOTWSheikahFanPick(self.sheikahLayout, runePosition, fanOwned);
++        else {
++            runeFallback = YES;
++            wheelAnchor = runePosition.x;
++            flickNext = now + kWheelSettle;
++        }
++    }
++    if (runeGoal || runeFallback) {
++        if (flickDirection && now >= flickEnd) { flickDirection = 0; changed = YES; }
++        if (runeSteps && now >= flickNext) {
++            flickDirection = runeSteps > 0 ? 1 : -1;
++            runeSteps -= flickDirection;
++            flickEnd = now + kRuneFlick;
++            flickNext = flickEnd + kRuneFlick;
++            changed = YES;
++        }
++        if (runeGoal && ((!runeSteps && now >= flickNext + kWheelSettle) || now >= wheelRelease)) {
++            runeGoal = NO;
++            changed = YES;
++            goalClosed = now < wheelRelease;
++            if (!goalClosed) {
++                BOOL hadTap = bufferedRuneTapAt != 0;
++                [self clearBufferedRune];
++                if (hadTap) [self showRuneHint:@"Выбери руну снова"];
++            }
++        }
++    }
++    if (changed) [self contactsChanged];
++#if defined(GAME_BOTW160)
++    if (goalClosed) [self awaitBufferedRuneAfterNeutral:now];
++    [self sendBufferedRuneAt:now];
++    [self pollBufferedRunePulse];
++#endif
++    if (changed) [self hideLater];
++    if (!runeGoal && !runeNeutralUntil && !runePulseToken && (!runeOwner || fanOwned)) {
++        [runeTimer invalidate];
++        runeTimer = nil;
++    }
++}
++
++- (void)startRuneTimer {
++    if (runeTimer) return;
++    __weak typeof(self) weakSelf = self;
++    runeTimer = [NSTimer timerWithTimeInterval:1.0 / 60 repeats:YES block:^(NSTimer *timer) {
++        (void)timer;
++        [weakSelf runeTickAt:CACurrentMediaTime()];
++    }];
++    [NSRunLoop.mainRunLoop addTimer:runeTimer forMode:NSRunLoopCommonModes];
++}
++
++- (void)moveRune:(CGPoint)point {
++    runePosition = point;
++    if (fanOwned) {
++        fanSelection = BOTWSheikahFanPick(self.sheikahLayout, point, fanOwned);
++        [self setNeedsDisplay];
++    } else if (runeFallback) {
++        CGFloat step = MAX(26, CGRectGetWidth(self.area) * .06);
++        int crossed = (int)((point.x - wheelAnchor) / step);
++        runeSteps = MAX(-7, MIN(7, runeSteps + crossed));
++        wheelAnchor += crossed * step;
++    }
++}
++
++#if defined(GAME_BOTW160)
++static const CFTimeInterval kRuneVerifyDeadline = .18;
++
++- (void)finishRuneVerification:(NSUInteger)generation target:(int)target
++                      snapshot:(BOTWTouchSnapshot)snapshot deadline:(CFTimeInterval)deadline {
++    if (!runeChecking || generation != runeGeneration) return;
++    runeChecking = NO;
++    CFTimeInterval now = CACurrentMediaTime();
++    int current = snapshot.selected_rune;
++    uint8_t mask = snapshot.owned_runes;
++    BOOL fresh = now <= deadline && snapshot.owned_runes_known && current >= 0 && current < 8 &&
++                 (mask & (1u << current)) && (mask & (1u << target));
++    if (!fresh) {
++        [self clearBufferedRune];
++        preferNativeRuneWheel = YES;
++        [self showRuneHint:@"Выбери руну снова"];
++        [self readHUD];
++    } else if (target != current) {
++        unsigned targetMask = (1u << target) - 1, currentMask = (1u << current) - 1;
++        runeSteps = __builtin_popcount(mask & targetMask) - __builtin_popcount(mask & currentMask);
++        runeGoal = YES;
++        [self interruptCamera];
++        flickDirection = 0;
++        flickEnd = 0;
++        flickNext = now + kWheelSettle;
++        wheelRelease = now + 4;
++        [self startRuneTimer];
++    }
++    [self contactsChanged];
++    if (fresh && target == current) [self awaitBufferedRuneAfterNeutral:now];
++    [self hideLater];
++}
++
++- (void)verifyRuneSelection:(int)target {
++    runeChecking = YES;
++    runeTarget = target;
++    NSUInteger generation = ++runeGeneration;
++    CFTimeInterval deadline = CACurrentMediaTime() + kRuneVerifyDeadline;
++    __weak typeof(self) weakSelf = self;
++    dispatch_async(hudQueue, ^{
++        BOTWTouchSnapshot snapshot = {.selected_rune = -1};
++        botw_touch_snapshot(&snapshot);
++        dispatch_async(dispatch_get_main_queue(), ^{
++            [weakSelf finishRuneVerification:generation target:target snapshot:snapshot deadline:deadline];
++        });
++    });
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRuneVerifyDeadline * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++        [weakSelf finishRuneVerification:generation target:target snapshot:(BOTWTouchSnapshot){.selected_rune = -1}
++                                  deadline:deadline];
++    });
++}
++#endif
++
++- (void)endRune {
++    CFTimeInterval now = CACurrentMediaTime();
++    if (!runeHeld && now - runeSince >= kRuneHold) [self runeTickAt:now];
++    if (!runeHeld) {
++        [self pulseRune];
++    } else if (fanOwned && fanSelection >= 0) {
++#if defined(GAME_BOTW160)
++        [self verifyRuneSelection:fanSelection];
++#endif
++    } else if (runeFallback && (runeSteps || now < flickEnd)) {
++        // A fast release can precede the next game's poll. Let the queued tilt finish first.
++        runeGoal = YES;
++        wheelRelease = now + 4;
++    } else runeSteps = 0;
++    runeOwner = nil;
++    runeHeld = runeFallback = NO;
++    fanOwned = 0;
++    if (runeGoal) [self startRuneTimer];
++    else { [runeTimer invalidate]; runeTimer = nil; flickEnd = 0; }
++    [self contactsChanged];
++    [self hideLater];
++}
++
++- (void)stopCamera {
++    [cameraTimer invalidate];
++    cameraTimer = nil;
++    cameraDX = cameraDY = 0;
++    cameraTickAt = 0;
++}
++
++- (void)interruptCamera {
++    [self stopCamera];
++    // A released aim can still be queued. Discard every camera channel before changing the button state.
++    runtime_touch_pad_camera_sample(0, 0, 0);
++    runtime_touch_pad_camera_sample(0, 0, BOTWSheikahButton(BOTWSheikahThrow));
++    runtime_touch_pad_camera_sample(0, 0, BOTWSheikahButton(BOTWSheikahBow));
++}
++
++- (BOTWSheikahPickerTouch *)pickerForContact:(id)contact {
++    for (BOTWSheikahPickerTouch *picker in pickerTouches) if (picker.contact == contact) return picker;
++    return nil;
++}
++
++- (uint64_t)cameraSampleAim {
++    uint64_t ownerAim = rightOwner ? [buttonTouches objectForKey:rightOwner].unsignedLongLongValue : 0;
++    if (self.floatingCameraStick && rightOwner && rightOwner == freeLookOwner)
++        return touchButtons & kTouchAimBow ? kTouchAimBow : touchButtons & kTouchAimThrow;
++    return ownerAim;
++}
++
++/* Sample the latest motion once for the next Npad read. An idle finger emits no further samples. */
++- (void)sampleCameraAt:(CFTimeInterval)now {
++    CFTimeInterval dt = cameraTickAt > 0 ? now - cameraTickAt : 0;
++    cameraTickAt = now;
++    if (dt < 1.0 / 120 || dt > .10) dt = 1.0 / 60;
++    CGFloat dx = cameraDX, dy = cameraDY, distance = hypot(dx, dy);
++    cameraDX = cameraDY = 0;
++    if (distance >= .5 && self.area.size.height > 0) {
++        CGFloat speed = distance / (self.area.size.height * dt);
++        uint64_t aim = self.cameraSampleAim;
++        CGFloat gain = aim || (touchButtons & kTouchAimMask) ? 1 : self.touchCameraSensitivity / 100.0;
++        CGFloat length = MIN(1, (.15 + .85 * speed) * gain);
++        int32_t x = (int32_t)(32767 * length * dx / distance);
++        int32_t y = (int32_t)(-32767 * length * dy / distance);
++        runtime_touch_pad_camera_sample(x, y, aim);
++    } else {
++        [self stopCamera];
++    }
++}
++
++- (void)startCameraTimer {
++    if (cameraTimer) return;
++    cameraTickAt = CACurrentMediaTime();
++    __weak typeof(self) weakSelf = self;
++    cameraTimer = [NSTimer timerWithTimeInterval:1.0 / 60 repeats:YES block:^(NSTimer *timer) {
++        (void)timer;
++        [weakSelf sampleCameraAt:CACurrentMediaTime()];
++    }];
++    [NSRunLoop.mainRunLoop addTimer:cameraTimer forMode:NSRunLoopCommonModes];
++}
++
++- (void)beginContact:(id)contact at:(CGPoint)point {
++    CGRect area = self.area;
++    if (self.hidden || !self.userInteractionEnabled || !CGRectContainsPoint(area, point)) return;
++    BOTWSheikahControl control = BOTWSheikahControlCount;
++    uint64_t bit;
++    BOOL restingStickTouched = NO;
++    if (self.swipeLayout) {
++        BOTWSheikahLayout layout = self.sheikahLayout;
++        control = BOTWSheikahHit(layout, point, touchButtons, fanOwned != 0);
++        bit = control == BOTWSheikahControlCount ? 0 : BOTWSheikahButton(control);
++        restingStickTouched = self.sheikahOverrides[BOTWSheikahEditKey(BOTWSheikahMove)] &&
++            CGRectContainsPoint(BOTWSheikahEditTarget(layout, BOTWSheikahMove).hit, point);
++        if (restingStickTouched && control < BOTWSheikahControlCount &&
++            hypot(point.x - layout.stick.x, point.y - layout.stick.y) <
++            hypot(point.x - layout.target[control].center.x, point.y - layout.target[control].center.y)) {
++            control = BOTWSheikahControlCount;
++            bit = 0;
++        }
++        if (!bit && !restingStickTouched && point.x < CGRectGetMidX(area) &&
++            point.y < CGRectGetMinY(area) + CGRectGetHeight(area) * .30) return;
++    } else bit = [self buttonAt:point];
++    concealed = NO;
++    [hideTimer invalidate]; hideTimer = nil;
++    if (control == BOTWSheikahRune) {
++#if defined(GAME_BOTW160)
++        [self pollBufferedRunePulse];
++#endif
++        if (runeOwner || runePulseToken) return;
++        if (runeChecking || runeGoal || runeNeutralUntil) {
++            if (runeTarget >= 0 && !bufferedRuneOwner && !bufferedRuneTapAt) {
++                bufferedRuneOwner = contact;
++                bufferedRuneOrigin = point;
++                bufferedRuneDownAt = CACurrentMediaTime();
++            }
++            return;
++        }
++        runeOwner = contact;
++        runeRetryUntil = 0;
++        runePosition = point;
++        runeSince = CACurrentMediaTime();
++        [self startRuneTimer];
++    } else if (isPicker(control)) {
++        BOTWSheikahPickerTouch *picker = [BOTWSheikahPickerTouch new];
++        picker.contact = contact;
++        picker.origin = picker.position = point;
++        picker.button = bit;
++        if (!pickerTouches.count) {
++            freeLookOrigin = freeLookPosition;
++            [self interruptCamera];
++        }
++        [pickerTouches addObject:picker];
++    } else if (bit) {
++        if (self.swipeLayout && self.floatingCameraStick && freeLookOwner && rightOwner == freeLookOwner && aimPriority(bit))
++            [self stopCamera]; // A released, tagged aim sample still belongs to the next Npad read.
++        [buttonTouches setObject:@(bit) forKey:contact];
++        if (self.swipeLayout && aimPriority(bit))
++            [aimTouches setObject:[NSValue valueWithCGPoint:point] forKey:contact];
++    } else if (restingStickTouched || point.x < CGRectGetMidX(area)) {
++        if (leftOwner) return;
++        leftOwner = contact;
++        leftPosition = leftOrigin = point;
++    } else {
++        if (self.swipeLayout) {
++            if (freeLookOwner) return;
++            freeLookOwner = contact;
++            freeLookPosition = freeLookOrigin = point;
++            floatingCameraOrigin = point;
++        } else if (rightOwner) return;
++        if (!rightOwner) {
++            rightOwner = contact;
++            rightPosition = rightOrigin = point;
++        }
++    }
++    [self contactsChanged];
++}
++
++- (void)moveContact:(id)contact to:(CGPoint)point {
++    if (contact == runeOwner) { [self moveRune:point]; return; }
++    if (contact == bufferedRuneOwner) {
++        if (hypot(point.x - bufferedRuneOrigin.x, point.y - bufferedRuneOrigin.y) > 18) bufferedRuneOwner = nil;
++        return;
++    }
++    BOTWSheikahPickerTouch *picker = [self pickerForContact:contact];
++    if (picker) {
++        picker.position = point;
++        if (picker == pickerTouches.firstObject) [self contactsChanged];
++        return;
++    }
++    if (contact == freeLookOwner) {
++        freeLookPosition = point;
++        BOOL freeAim = self.floatingCameraStick && contact == rightOwner && (touchButtons & kTouchAimMask);
++        if (freeAim) floatingCameraOrigin = point;
++        if (pickerTouches.count || (self.floatingCameraStick && !freeAim)) {
++            if (contact == rightOwner) rightPosition = point;
++            [self contactsChanged];
++            return;
++        }
++        if (contact != rightOwner) return;
++    }
++    if (contact == leftOwner) {
++        leftPosition = point;
++        [self contactsChanged];
++        return;
++    }
++    if (self.swipeLayout && (pickerTouches.count || runeFallback || runeGoal ||
++                            (fanOwned && ![aimTouches objectForKey:contact]))) {
++        if (contact == rightOwner) rightPosition = point;
++        if ([aimTouches objectForKey:contact]) [aimTouches setObject:[NSValue valueWithCGPoint:point] forKey:contact];
++        return;
++    }
++    NSValue *aim = [aimTouches objectForKey:contact];
++    if (aim && contact != rightOwner) {
++        CGPoint previous = aim.CGPointValue;
++        if (hypot(point.x - previous.x, point.y - previous.y) < 1) return;
++        [aimTouches setObject:[NSValue valueWithCGPoint:point] forKey:contact];
++        int priority = aimPriority([buttonTouches objectForKey:contact].unsignedLongLongValue);
++        uint64_t ownerAim = rightOwner ? [buttonTouches objectForKey:rightOwner].unsignedLongLongValue : 0;
++        if (priority <= aimPriority(ownerAim)) return;
++        [self stopCamera];
++        if (rightOwner) runtime_touch_pad_camera_sample(0, 0, ownerAim);
++        rightOwner = contact;
++        rightPosition = previous;
++    } else if (aim) {
++        [aimTouches setObject:[NSValue valueWithCGPoint:point] forKey:contact];
++    }
++    if (contact == rightOwner) {
++        if (self.swipeLayout) {
++            cameraDX += point.x - rightPosition.x;
++            cameraDY += point.y - rightPosition.y;
++            rightPosition = point;
++            if (cameraDX || cameraDY) [self startCameraTimer];
++            return;
++        }
++        rightPosition = point;
++    } else if ([buttonTouches objectForKey:contact]) {
++        if (self.swipeLayout) return; // Each action belongs to the finger that took it.
++        [buttonTouches setObject:@([self buttonAt:point]) forKey:contact];
++    } else return;
++    [self contactsChanged];
++}
++
++- (void)endContact:(id)contact {
++    if (contact == runeOwner) { [self endRune]; return; }
++    if (contact == bufferedRuneOwner) {
++        CFTimeInterval now = CACurrentMediaTime();
++        bufferedRuneOwner = nil;
++        if (now - bufferedRuneDownAt < kRuneHold) bufferedRuneTapAt = now;
++        return;
++    }
++    BOTWSheikahPickerTouch *picker = [self pickerForContact:contact];
++    if (picker) {
++        BOOL wasOwner = picker == pickerTouches.firstObject;
++        [pickerTouches removeObjectIdenticalTo:picker];
++        if (wasOwner) {
++            BOTWSheikahPickerTouch *next = pickerTouches.firstObject;
++            if (next) next.origin = next.position;
++            freeLookOrigin = freeLookPosition;
++        }
++        [self contactsChanged];
++        [self hideLater];
++        return;
++    }
++    NSNumber *button = [buttonTouches objectForKey:contact];
++    BOOL hadButton = button != nil;
++    BOOL hadFreeLook = contact == freeLookOwner;
++    // The final free-finger aim sample needs the original camera owner and held button.
++    if (contact == rightOwner && self.swipeLayout && (cameraDX || cameraDY))
++        [self sampleCameraAt:CACurrentMediaTime()];
++    if (hadFreeLook) {
++        freeLookOwner = nil;
++        BOTWSheikahPickerTouch *active = pickerTouches.firstObject;
++        if (active) active.origin = active.position;
++    }
++    if (contact == leftOwner) leftOwner = nil;
++    else if (contact == rightOwner) {
++        [self stopCamera];
++        rightOwner = freeLookOwner;
++        rightPosition = freeLookPosition;
++    } else if (!hadButton && !hadFreeLook) return;
++    if (self.swipeLayout && self.floatingCameraStick && freeLookOwner && rightOwner == freeLookOwner &&
++        self.cameraSampleAim == button.unsignedLongLongValue && aimPriority(button.unsignedLongLongValue)) {
++        if (cameraDX || cameraDY) [self sampleCameraAt:CACurrentMediaTime()];
++        [self stopCamera];
++    }
++    if (hadButton) [buttonTouches removeObjectForKey:contact];
++    [aimTouches removeObjectForKey:contact];
++    [self contactsChanged];
++    [self hideLater];
++}
++
++- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
++    return self.swipeLayout ? CGRectContainsPoint(self.area, point) : [super pointInside:point withEvent:event];
++}
++
++- (NSArray *)accessibilityElements {
++    if (!self.swipeLayout || concealed || !self.userInteractionEnabled) return [super accessibilityElements];
++    BOTWSheikahLayout layout = self.sheikahLayout;
++    NSMutableArray *elements = [NSMutableArray array];
++    __weak typeof(self) weakSelf = self;
++    for (BOTWSheikahControl i = 0; i < BOTWSheikahControlCount; i++) {
++        if (!BOTWSheikahVisible(i, touchButtons, fanOwned != 0)) continue;
++        BOTWSheikahAccessibilityButton *button = [[BOTWSheikahAccessibilityButton alloc] initWithAccessibilityContainer:self];
++        button.accessibilityLabel = BOTWSheikahLabel(i);
++        button.accessibilityTraits = UIAccessibilityTraitButton;
++        button.accessibilityFrameInContainerSpace = layout.target[i].hit;
++        CGPoint point = layout.target[i].center;
++        button.activate = ^BOOL{
++            TOTKTouchPad *pad = weakSelf;
++            if (!pad) return NO;
++            NSObject *contact = [NSObject new];
++            [pad beginContact:contact at:point];
++            [pad endContact:contact];
++            return YES;
++        };
++        [elements addObject:button];
++    }
++    return elements;
+ }
+ 
+ - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+-    (void)event; concealed = NO; [hideTimer invalidate]; hideTimer = nil;
+-    for (UITouch *t in touches) {
+-        CGPoint p = [t locationInView:self]; NSValue *v = [NSValue valueWithCGPoint:p]; [points setObject:v forKey:t];
+-        if ([self buttonAt:p]) continue;
+-        [(p.x < CGRectGetMidX(self.bounds) ? leftOrigins : rightOrigins) setObject:v forKey:t];
+-    }
+-    [self updateState];
++    (void)event;
++    for (UITouch *touch in touches) [self beginContact:touch at:[touch locationInView:self]];
+ }
+ - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+     (void)event;
+-    for (UITouch *t in touches) [points setObject:[NSValue valueWithCGPoint:[t locationInView:self]] forKey:t];
+-    [self updateState];
++    for (UITouch *touch in touches) [self moveContact:touch to:[touch locationInView:self]];
+ }
+ - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+     (void)event;
+-    for (UITouch *t in touches) { [points removeObjectForKey:t]; [leftOrigins removeObjectForKey:t]; [rightOrigins removeObjectForKey:t]; }
+-    [self updateState]; [self hideLater];
+-}
+-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self touchesEnded:touches withEvent:event]; }
+-- (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsDisplay]; }
++    for (UITouch *touch in touches) {
++        if (touch == runeOwner || touch == bufferedRuneOwner)
++            [self moveContact:touch to:[touch locationInView:self]];
++        [self endContact:touch];
++    }
++}
++- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    (void)touches; (void)event;
++    [self releaseTouches];
++    [self hideLater];
++}
++- (void)safeAreaInsetsDidChange {
++    [super safeAreaInsetsDidChange];
++    [self releaseTouches];
++    [self hideLater];
++}
+ 
+ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r) {
+     int32_t x, y; stick_axes(o, p, r, &x, &y); CGContextStrokeEllipseInRect(c, CGRectMake(o.x - r, o.y - r, 2 * r, 2 * r));
+@@ -155,18 +1166,77 @@
+     CGContextFillEllipseInRect(c, knob); CGContextStrokeEllipseInRect(c, knob);
+ }
+ 
++- (void)drawSheikah:(CGContextRef)context {
++    CGRect area = self.area;
++    BOTWSheikahLayout layout = self.sheikahLayout;
++    if (layout.stickRadius <= 0) return;
++    CGContextSaveGState(context);
++    CGContextClipToRect(context, area);
++    CGPoint stick = leftOwner ? leftOrigin : layout.stick;
++    CGFloat r = layout.stickRadius;
++    stick.x = MAX(CGRectGetMinX(area) + r, MIN(stick.x, CGRectGetMaxX(area) - r));
++    stick.y = MAX(CGRectGetMinY(area) + r, MIN(stick.y, CGRectGetMaxY(area) - r));
++    int32_t lx = 0, ly = 0;
++    if (leftOwner) stick_axes(leftOrigin, leftPosition, r, &lx, &ly);
++    CGPoint knob = CGPointMake(stick.x + lx / 32767.0 * r, stick.y - ly / 32767.0 * r);
++    BOTWSheikahDrawStick(stick, knob, r, leftOwner != nil);
++
++    if ([self showsFloatingCameraStick]) {
++        CGFloat radius = self.floatingCameraRadius;
++        int32_t x, y;
++        floating_camera_axes(floatingCameraOrigin, freeLookPosition, radius, self.touchCameraSensitivity / 100.0, &x, &y);
++        CGPoint thumb = CGPointMake(floatingCameraOrigin.x + x / 32767.0 * radius,
++                                    floatingCameraOrigin.y - y / 32767.0 * radius);
++        BOTWSheikahDrawStick(floatingCameraOrigin, thumb, radius, YES);
++    }
++
++    for (BOTWSheikahControl i = 0; i < BOTWSheikahControlCount; i++) {
++        if (!BOTWSheikahVisible(i, touchButtons, fanOwned != 0)) continue;
++        UIImage *icon = nil;
++#if defined(GAME_BOTW160)
++        icon = [self iconForControl:i];
++#endif
++        BOOL held = i == BOTWSheikahRune ? runeOwner || runeGoal || runeChecking : (touchButtons & BOTWSheikahButton(i)) != 0;
++        BOTWSheikahDrawControl(layout.target[i], i, icon, held);
++    }
++
++    if (fanOwned) {
++        NSDictionary *icons = nil;
++#if defined(GAME_BOTW160)
++        icons = runeIcons;
++#endif
++        BOTWSheikahDrawFan(layout, fanOwned, fanCurrent, fanSelection, icons);
++    }
++    if (CACurrentMediaTime() < runeRetryUntil) {
++        NSShadow *shadow = [NSShadow new];
++        shadow.shadowColor = UIColor.blackColor;
++        shadow.shadowOffset = CGSizeMake(0, 1);
++        shadow.shadowBlurRadius = 2;
++        UIFont *font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
++        NSDictionary *attributes = @{NSFontAttributeName:font, NSForegroundColorAttributeName:UIColor.whiteColor,
++                                     NSShadowAttributeName:shadow};
++        CGSize size = [runeHint sizeWithAttributes:attributes];
++        BOTWSheikahTarget rune = layout.target[BOTWSheikahRune];
++        [runeHint drawAtPoint:CGPointMake(rune.center.x - rune.radius - size.width - 9, rune.center.y - size.height / 2)
++           withAttributes:attributes];
++    }
++    CGContextRestoreGState(context);
++}
++
+ - (void)drawRect:(CGRect)rect {
+     if (concealed) return;
++    if (self.swipeLayout) { [self drawSheikah:UIGraphicsGetCurrentContext()]; return; }
+     (void)rect; CGContextRef c = UIGraphicsGetCurrentContext(); UIColor *ink = [UIColor colorWithWhite:1 alpha:.32];
+     // One fill for every button and knob, set before each fill: drawing a label leaves the context's fill colour at the
+     // label's, which once made every button after A (the first drawn) brighter than A and the stick knobs.
+     CGColorRef fill = ink.CGColor; CGContextSetStrokeColorWithColor(c, ink.CGColor); CGContextSetFillColorWithColor(c, fill); CGContextSetLineWidth(c, 2);
+     CGFloat r = self.stickRadius;
+-    // Each stick is drawn where its finger went down, or at its resting place while idle.
+-    if (!leftOrigins.count) { CGPoint rest = [self restingStick:NO]; draw_stick(c, rest, rest, r); }
+-    if (!rightOrigins.count) { CGPoint rest = [self restingStick:YES]; draw_stick(c, rest, rest, r); }
+-    for (UITouch *t in leftOrigins.keyEnumerator) draw_stick(c, [leftOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, r);
+-    for (UITouch *t in rightOrigins.keyEnumerator) draw_stick(c, [rightOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, r);
++    CGPoint left = leftOwner ? leftOrigin : [self restingStick:NO];
++    CGPoint right = rightOwner ? rightOrigin : [self restingStick:YES];
++    if (r > 0) {
++        draw_stick(c, left, leftOwner ? leftPosition : left, r);
++        draw_stick(c, right, rightOwner ? rightPosition : right, r);
++    }
+     NSDictionary *attrs = @{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold], NSForegroundColorAttributeName: ink};
+     TouchButton b[kButtonCount]; [self buttons:b];
+     for (int i = 0; i < kButtonCount; i++) {

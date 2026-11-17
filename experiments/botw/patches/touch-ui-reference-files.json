@@ -1,0 +1,62 @@
+{
+  "games/totk/ios/Sources/BOTWGraphicsSettings.h": {
+    "before_sha256": null,
+    "after_sha256": "9f4f3a4d31d957e4abb8ad07195bafcb9e5837c28251ed3f383529bece721e5a"
+  },
+  "games/totk/ios/Sources/BOTWGraphicsSettings.m": {
+    "before_sha256": null,
+    "after_sha256": "600ddc0a70829a247f7792a013fbcea769bf286cea503d845714d496018f33b1"
+  },
+  "games/totk/ios/Sources/BOTWSheikahEditor.h": {
+    "before_sha256": null,
+    "after_sha256": "e3b1809aa63a6c8a6dfc482561b3e4abb45703aea80a16784706e1edf1bd98a4"
+  },
+  "games/totk/ios/Sources/BOTWSheikahEditor.m": {
+    "before_sha256": null,
+    "after_sha256": "06d064df8cc26b9c3e3e9af7c1e78530c1ba03dc64f05401a348822abe1fb48a"
+  },
+  "games/totk/ios/Sources/BOTWSheikahHUD.h": {
+    "before_sha256": null,
+    "after_sha256": "a37c8ee12c0793723bd4c8727e1b9da4ecc85d9308d3beec2a7c76a42355c854"
+  },
+  "games/totk/ios/Sources/BOTWSheikahHUD.m": {
+    "before_sha256": null,
+    "after_sha256": "a549701afcc9dcecfb484151959a06763317ea5cdf21c442950c37af5be92f6e"
+  },
+  "games/totk/runtime/botw_picture.h": {
+    "before_sha256": null,
+    "after_sha256": "b4fd47535f72ce33f84db0966e014f6ad9146473da3a64ad289a8fa35fd25732"
+  },
+  "games/totk/runtime/botw_scene_resolution.h": {
+    "before_sha256": null,
+    "after_sha256": "488c938a2a570e89d1298629ce9b4aeef1524a63f684fd108b7bcf2ee03d6d0a"
+  },
+  "games/totk/third_party/d2r_gfx/gfx/nvn/fps_overlay.h": {
+    "before_sha256": "91893655aa88ba4050e41227da145ac9512d2e1338bd9e7f882cde57eed8c5a8",
+    "after_sha256": "9e5b77973f261bff0a02a264b3e93467e3b33c6a88e5a170a8ab158038312185"
+  },
+  "games/totk/runtime/gamepad.m": {
+    "before_sha256": "60d0e35c174f67e33b59922062496c4045b36f8fb09e0e56c1c3611536db3206",
+    "after_sha256": "eb9bfc2a34fb5c28c672ba27cc759fa030e6e6bae686edbe57be0086aef068bc"
+  },
+  "games/totk/runtime/input.c": {
+    "before_sha256": "b589bc005ae5e1109821bdb143faebe2d802bb315c67fa0a132f83ba748a2408",
+    "after_sha256": "f749dcf9c2bc515992a6cdaf35c1d2374f2c237de4000148e865a66a360dbab7"
+  },
+  "games/totk/ios/Sources/main.m": {
+    "before_sha256": "be6f64e9dccb4a52a164c3a63baaf48ed9747df61c695a25e470964f634b2429",
+    "after_sha256": "db2fd36319ea50aa65ef7cb562e753b9e3e24bc3bda0b40a044b65fcb1d79e8b"
+  },
+  "games/totk/runtime/runtime.h": {
+    "before_sha256": "3fecc384e14987c11410ef4f7a55063a737215ba45a263b7a9fea4ce2564bf3d",
+    "after_sha256": "ab51cd5005e0305729038625ea9c0d8338277ba4584c681d5755b1c674101199"
+  },
+  "games/totk/ios/Sources/touch_pad.h": {
+    "before_sha256": "4dd708e6cfb530fcd2c6407bce0dbbb5cbf261de7d093709373f3374c4718fc2",
+    "after_sha256": "2e089c86b94c983134aa5ac329cfc816ca9028e93dbe4ed9e424b4711ef2882e"
+  },
+  "games/totk/ios/Sources/touch_pad.m": {
+    "before_sha256": "4b698f5c5a549e4ad050add5ec6c2650bdf95b61de6394dd71bf3d5e8ca7284d",
+    "after_sha256": "c983bbc226c3ce20f844bb329fe29cd6e7ac8db69644914362ceadd3709f5d57"
+  }
+}

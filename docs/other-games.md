@@ -6,6 +6,10 @@ per game and version. Check its current supported-title table and device notes;
 the pinned version in this guide is intentionally older than upstream's moving
 default branch. A game's availability on Mac doesn't establish iPhone support.
 
+The separate [Fire Emblem experiments](../experiments/fire-emblem/README.en.md)
+record source-level work for a different port. They are not a claim that this
+BOTW recipe works unchanged for that game; follow their stated test boundaries.
+
 Before adapting the save engine to another game:
 
 1. Verify that the exact game, update and both target platforms are supported by

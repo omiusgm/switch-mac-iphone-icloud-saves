@@ -44,6 +44,23 @@ requirements for using your own copy and system files.
 сохранений, данных Apple Account и идентификаторов устройств. Используйте
 собственную копию и системные файлы в соответствии с требованиями исходного проекта.
 
+## Additional work / Дополнительные наработки
+
+- [BOTW experiments](experiments/botw/README.md) document later work on Mac
+  controller prompts, the iPhone interface and display proportions. An offline
+  prototype or a menu screenshot is not evidence that a whole game session,
+  physical controller or device-to-device save exchange has been verified.
+- [Fire Emblem: Three Houses experiments](experiments/fire-emblem/README.en.md)
+  preserve separately scoped work for a different native port. They do not turn
+  the BOTW overlay into a universal save-sync solution; check that project's
+  own tests and device requirements before using it.
+- [Наработки BOTW](experiments/botw/README.md) описывают последующую работу над
+  подсказками геймпада на Mac, интерфейсом iPhone и пропорциями экрана. Прототип
+  или снимок меню не подтверждает работу всей игры и физического геймпада.
+- [Наработки Fire Emblem: Three Houses](experiments/fire-emblem/README.md)
+  относятся к другому нативному порту. Они не делают обмен сохранениями BOTW
+  универсальным; проверяйте требования и испытания этой игры отдельно.
+
 ## How syncing works / Как работает обмен
 
 **English**
@@ -81,8 +98,9 @@ new upstream releases, so this guide pins the tested upstream commit.
 
 ## Find this guide / Ключевые слова
 
-Nintendo Switch, Zelda BOTW, Breath of the Wild, Mac, MacBook, Apple silicon,
-iPhone, iOS, iCloud Drive, cross-save, cloud saves, game saves, AI agent, Codex,
+Nintendo Switch, Zelda BOTW, Breath of the Wild, Fire Emblem Three Houses, Mac,
+MacBook, Apple silicon, iPhone, iPad, iOS, iCloud Drive, cross-save, cloud saves,
+game saves, DualShock 4, PS4 controller, touch controls, AI agent, Codex,
 Claude Code, MacNativeGames, сохранения, синхронизация, облако, инструкция.
 
 [MIT licence](LICENSE) · [Upstream attribution](NOTICE.md)

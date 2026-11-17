@@ -1,0 +1,542 @@
+diff --git a/dm/gfx/nvn/nvn_mtl.h b/dm/gfx/nvn/nvn_mtl.h
+index b035659..cfa58e6 100644
+--- a/dm/gfx/nvn/nvn_mtl.h
++++ b/dm/gfx/nvn/nvn_mtl.h
+@@ -10,6 +10,7 @@ void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t
+ void mtl_set_depth_zero(int on);          // NVN depth mode: 1 = near is 0 (D3D / Metal), 0 = near is -w (GL, NVN's default); picks the vertex shaders' entry point (see shader_load in nvn_mtl.m)
+ void mtl_set_origin_lower_left(int on);   // NVN window origin: 1 = lower left (GL, NVN's default), 0 = upper left (D3D / Metal); see nvn_mtl.m
+ void mtl_set_queue_origin_lower_left(int on); // Raster flip captured at NVN queue creation; selected under the submit lock.
++void mtl_present_set_upscale(int enabled);  // Request MetalFX on the next eligible present, or return to standard scaling.
+ void bf_want_note(const char *key);
+ 
+ // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index c8699b5..7313b24 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -10482,16 +10482,33 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
+ typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out; uint64_t made_at; int made; NSUInteger refused[6]; } fx_state;
+ static fx_state g_fx_present;   // only the present thread encodes or replaces the scaler
+ static id<MTL4Compiler> g_fx_comp;
+-static int g_fx_mode = -1;   // 1 = metalfx, 0 = off
++static _Atomic int g_fx_mode = -1;   // requested mode: -1 = read launch settings, 1 = MetalFX, 0 = standard
++void mtl_present_set_upscale(int enabled) {
++    int mode = !!enabled;
++    if (atomic_exchange_explicit(&g_fx_mode, mode, memory_order_relaxed) != mode)
++        MLOG("present upscaling: requested %s during play", mode ? "MetalFX" : "standard");
++}
+ static int fx_mode(void) {
+-    if (g_fx_mode >= 0) return g_fx_mode;
+-    const char *e = getenv("DM_PRESENT_UPSCALE"); int v = 0;
+-    if (e && (!strcmp(e, "metalfx") || !strcmp(e, "1"))) v = 1;
+-    else if (e && (!strcmp(e, "off") || !strcmp(e, "0"))) v = 0;
+-    else if (e && *e) MLOG("[RED] DM_PRESENT_UPSCALE=%s: metalfx or off; keeping %s", e, v ? "metalfx" : "off");
+-    if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("present upscaling: this GPU has no Metal 4 MetalFX spatial scaler; the present scales bilinearly"); v = 0; }
+-    MLOG("present upscaling (DM_PRESENT_UPSCALE): %s", v ? "metalfx, MetalFX's spatial scaler where the picture is shown larger than the game renders it" : "off, bilinear");
+-    return g_fx_mode = v;
++    int mode = atomic_load_explicit(&g_fx_mode, memory_order_relaxed);
++    if (mode < 0) {
++        const char *e = getenv("DM_PRESENT_UPSCALE");
++        int configured = e && (!strcmp(e, "metalfx") || !strcmp(e, "1"));
++        // Do not overwrite a choice made by the UI while the first present was starting.
++        if (atomic_compare_exchange_strong_explicit(&g_fx_mode, &mode, configured, memory_order_relaxed, memory_order_relaxed)) {
++            if (!configured && e && *e && strcmp(e, "off") && strcmp(e, "0"))
++                MLOG("[RED] DM_PRESENT_UPSCALE=%s: metalfx or off; keeping off", e);
++            MLOG("present upscaling (DM_PRESENT_UPSCALE): %s", configured ? "MetalFX where the picture is enlarged" : "off, bilinear");
++            mode = configured;
++        }
++    }
++    if (!mode) return 0;
++    static dispatch_once_t once;
++    static BOOL supported;
++    dispatch_once(&once, ^{
++        supported = g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev];
++        if (!supported) MLOG("present upscaling: this GPU has no Metal 4 MetalFX spatial scaler; the present scales bilinearly");
++    });
++    return supported;
+ }
+ // MetalFX scales the content (cw x ch) to its rectangle on the canvas (vp) when the rectangle is at least as large in both directions and larger in one
+ static int fx_wanted(MTLViewport vp, NSUInteger cw, NSUInteger ch) {
+@@ -10691,6 +10708,16 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     int kind = present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
+     if (!kind) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
+     int fx_kind = kind == PRESENT_METALFX;
++#if TARGET_OS_IOS
++    if (!strcmp(DM_GAME_ID, "010055D009F78000")) {
++        static int last_kind;   // written only by the present worker
++        if (last_kind != kind) {
++            MLOG("display frame encoded with %s (%lux%lu drawable)", fx_kind ? "MetalFX" : "standard scaling",
++                 (unsigned long)dr.texture.width, (unsigned long)dr.texture.height);
++            last_kind = kind;
++        }
++    }
++#endif
+     [cb endCommandBuffer];
+     MTL4CommitOptions *o = [MTL4CommitOptions new];
+     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+diff --git a/dm/gfx/tests/t_present_crop.m b/dm/gfx/tests/t_present_crop.m
+index d1e2d37..53c8dda 100644
+--- a/dm/gfx/tests/t_present_crop.m
++++ b/dm/gfx/tests/t_present_crop.m
+@@ -110,7 +110,7 @@ int main(void) { @autoreleasepool {
+         EXPECT("empty content is not upscaled",0,fx_wanted((MTLViewport){0,0,2868,1320,0,1},0,720));
+     }
+     if([MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]) {   // the present pass through MetalFX into an offscreen canvas (present_offscreen_m4, as DM_NVN_SHOT_OUT uses it)
+-        g_fx_mode=1;
++        mtl_present_set_upscale(1);
+         const int N=64;MTLTextureDescriptor *bd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB width:N height:N mipmapped:NO];bd.storageMode=MTLStorageModeShared;bd.usage=MTLTextureUsageShaderRead;
+         id<MTLTexture> big=[g_dev newTextureWithDescriptor:bd];uint8_t *bp=malloc(N*N*4);
+         for(int y=0;y<N;y++)for(int x=0;x<N;x++)memcpy(bp+4*(y*N+x),colors[(x>=N/2)+2*(y>=N/2)],4);
+@@ -121,7 +121,8 @@ int main(void) { @autoreleasepool {
+         od.storageMode=MTLStorageModePrivate;od.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;id<MTLTexture> out=[g_dev newTextureWithDescriptor:od];
+         const int crops[4][4]={{0},{8,8,48,48},{8,8,48,48},{8,8,48,48}};
+         for (int mode=0;mode<4;mode++) {
+-            g_fx_mode=mode==3?0:1;atomic_store(&g_origin_ll,mode==2);
++            mtl_present_set_upscale(mode != 3);
++            atomic_store(&g_origin_ll,mode==2);
+             EXPECT("offscreen present reports the scaler actually used",mode==3?PRESENT_STANDARD:PRESENT_METALFX,present_offscreen_wait(big,crops[mode],out));
+             id<MTLBuffer> rb=[g_dev newBufferWithLength:W*H*4 options:MTLResourceStorageModeShared];id<MTLCommandBuffer> cb=[g_q commandBuffer];id<MTLBlitCommandEncoder> bl=[cb blitCommandEncoder];
+             [bl copyFromTexture:out sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(W,H,1) toBuffer:rb destinationOffset:0 destinationBytesPerRow:W*4 destinationBytesPerImage:W*H*4];
+@@ -136,7 +137,8 @@ int main(void) { @autoreleasepool {
+             EXPECT("  quadrant centres keep their colours, raw bytes of the sRGB source (4 checked)",0,bad);
+         #undef PX
+         }
+-        atomic_store(&g_origin_ll,0);g_fx_mode=1;
++        atomic_store(&g_origin_ll,0);
++        mtl_present_set_upscale(1);
+         MTLTextureDescriptor *smallD=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:32 height:32 mipmapped:NO];
+         smallD.storageMode=MTLStorageModePrivate;smallD.usage=MTLTextureUsageRenderTarget;
+         id<MTLTexture> small=[g_dev newTextureWithDescriptor:smallD];int whole[4]={0},invalidCrop[4]={63,0,2,2};
+@@ -156,6 +158,11 @@ int main(void) { @autoreleasepool {
+         g_present_n=32;
+         EXPECT("same size reuses its scaler",PRESENT_METALFX,check_present_resize(big,192,96));
+         EXPECT("reuse makes no new scaler",2,g_fx_present.made);
++        mtl_present_set_upscale(0);
++        EXPECT("live switch to standard uses bilinear",PRESENT_STANDARD,check_present_resize(big,192,96));
++        mtl_present_set_upscale(1);
++        EXPECT("live switch back encodes MetalFX",PRESENT_METALFX,check_present_resize(big,192,96));
++        EXPECT("live toggle reuses the existing scaler",2,g_fx_present.made);
+         g_present_n=savedPresent;
+ 
+         // Whole-window capture uses the same upscale and remains asynchronous; its completion includes the final BGRA readback.
+@@ -173,7 +180,8 @@ int main(void) { @autoreleasepool {
+         });
+         grab_present(big,whole,CGSizeMake(W,H));
+         EXPECT("whole-window capture callback completes",0,(int)dispatch_semaphore_wait(grabbed,dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC)));
+-        res_remove(big);g_fx_mode=0;
++        res_remove(big);
++        mtl_present_set_upscale(0);
+     } else printf("no Metal 4 MetalFX spatial scaler on this GPU: the MetalFX present is not checked\n");
+ #endif
+     int invalid[4][4]={{-1,0,4,4},{0,-1,4,4},{0,0,0,4},{7,0,4,4}};
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index c41491e..f6c32f8 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -32,11 +32,11 @@
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_SWAP, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+ 
+ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+-static uint64_t g_touch_btn, g_shake_btn;
++static uint64_t g_touch_btn, g_shake_btn, g_gesture_btn;
+ static int32_t g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry;
+ static void publish(void) {   // the touch gamepad and the shake; the host ORs them with player 1's controller and takes whichever stick is deflected more (hle_hid.c)
+     pthread_mutex_lock(&g_mu);
+-    dm_input_set(g_touch_btn | g_shake_btn, g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry);
++    dm_input_set(g_touch_btn | g_shake_btn | g_gesture_btn, g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry);
+     pthread_mutex_unlock(&g_mu);
+ }
+ 
+@@ -121,7 +121,8 @@ static void phone_motion_start(void) {
+ static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+ int dm_opmode(void);   // hle_oe.c: 0 = handheld
+ 
+-@interface DmGamepad : UIView
++@interface DmGamepad : UIView <UIGestureRecognizerDelegate>
++@property (nonatomic) CGRect picture;
+ @end
+ static __weak DmGamepad *g_view;
+ static void pads_start(void);   // Physical controllers, below
+@@ -142,6 +143,8 @@ @implementation DmGamepad {
+     CALayer *_controls;                            // holds every control layer: hidden while a physical controller is connected (the view itself stays, for game touches)
+     BOOL _padOff;                                  // a physical controller is connected: every touch goes to the game
+     UITouch *_game[16];                            // touches on the game's touch screen by finger slot
++    NSTimeInterval _gestureReady;
++    NSUInteger _gestureEpoch;
+ }
+ 
+ static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
+@@ -186,9 +189,20 @@ - (instancetype)initWithFrame:(CGRect)f {
+         _swap = shape(_controls); _swapLabel = label(_swap, @"");
+         NSNumber *saved = [NSUserDefaults.standardUserDefaults objectForKey:k_layout_key];
+         int l = saved ? (int)saved.integerValue : DM_GAME_PAD_LAYOUT;
+-        if (l == 2 && dm_opmode() != 0) l = 0;   // Tap only in handheld mode (env.txt's DM_OPMODE may have changed it)
+         _full = l == 1; _tap = l == 2;
+         [self applyLayout];
++        // Three Houses has no native touch menus: translate simple gestures to
++        // controller buttons only in the optional button-free layout.
++        UITapGestureRecognizer *one = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(feTap:)];
++        UITapGestureRecognizer *two = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(feTap:)];
++        two.numberOfTouchesRequired = 2;
++        [one requireGestureRecognizerToFail:two];
++        for (UIGestureRecognizer *r in @[one, two]) { r.delegate = self; r.cancelsTouchesInView = NO; [self addGestureRecognizer:r]; }
++        for (NSNumber *direction in @[@(UISwipeGestureRecognizerDirectionUp), @(UISwipeGestureRecognizerDirectionDown), @(UISwipeGestureRecognizerDirectionLeft), @(UISwipeGestureRecognizerDirectionRight)]) {
++            UISwipeGestureRecognizer *r = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(feSwipe:)];
++            r.direction = direction.unsignedIntegerValue; r.delegate = self; r.cancelsTouchesInView = NO;
++            [one requireGestureRecognizerToFail:r]; [self addGestureRecognizer:r];
++        }
+         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+         [nc addObserver:self selector:@selector(padsChanged:) name:GCControllerDidConnectNotification object:nil];
+         [nc addObserver:self selector:@selector(padsChanged:) name:GCControllerDidDisconnectNotification object:nil];
+@@ -207,7 +221,7 @@ - (void)applyLayout {   // show / hide the controls for the current layout
+     [CATransaction commit];
+ }
+ - (void)nextLayout {   // 2D → 3D (→ Tap in handheld mode) → 2D: release every touch first (no key stays held), save, lay out again
+-    int l = _tap ? 0 : _full ? (dm_opmode() == 0 ? 2 : 0) : 1;
++    int l = _tap ? 0 : _full ? 2 : 1;
+     [self reset];
+     _full = l == 1; _tap = l == 2;
+     [NSUserDefaults.standardUserDefaults setObject:@(l) forKey:k_layout_key];
+@@ -253,6 +267,36 @@ - (int)btnAt:(CGPoint)p {   // locked keys (tested on touch-down only, then lock
+     return -1;
+ }
+ - (BOOL)inSwap:(CGPoint)p { return dist(p, self.swapCenter) <= K_SWAP_R * self.u * 1.6; }
++- (BOOL)gestureRecognizer:(UIGestureRecognizer *)recognizer shouldReceiveTouch:(UITouch *)touch {
++    (void)recognizer;
++    return _tap && !_padOff && ![self inSwap:[touch locationInView:self]];
++}
++- (void)fePulse:(int)bit {
++    if (!_tap || _padOff) return;
++    NSTimeInterval now = CACurrentMediaTime();
++    if (_gestureReady > now + 0.65) return; // Bound queued actions if the screen is tapped rapidly.
++    NSTimeInterval start = MAX(now, _gestureReady); _gestureReady = start + 0.18;
++    NSUInteger epoch = _gestureEpoch;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((start - now) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++        if (self->_gestureEpoch != epoch || !self->_tap || self->_padOff) return;
++        LOG("fire emblem touch gesture: controller button %d", bit);
++        pthread_mutex_lock(&g_mu); g_gesture_btn |= 1ull << bit; pthread_mutex_unlock(&g_mu); publish();
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++            if (self->_gestureEpoch != epoch) return;
++            pthread_mutex_lock(&g_mu); g_gesture_btn &= ~(1ull << bit); pthread_mutex_unlock(&g_mu); publish();
++        });
++    });
++}
++- (void)feTap:(UITapGestureRecognizer *)recognizer {
++    if (recognizer.state == UIGestureRecognizerStateRecognized) [self fePulse:recognizer.numberOfTouchesRequired == 2 ? B_B : B_A];
++}
++- (void)feSwipe:(UISwipeGestureRecognizer *)recognizer {
++    if (recognizer.state != UIGestureRecognizerStateRecognized) return;
++    int bit = recognizer.direction == UISwipeGestureRecognizerDirectionUp ? B_UP :
++              recognizer.direction == UISwipeGestureRecognizerDirectionDown ? B_DOWN :
++              recognizer.direction == UISwipeGestureRecognizerDirectionLeft ? B_LEFT : B_RIGHT;
++    [self fePulse:bit];
++}
+ - (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count)
+     uint64_t m = 0; CGFloat r = self.faceR * 1.25;
+     for (int b = B_A; b <= B_Y; b++) if (dist(p, [self facePos:b]) <= r) m |= 1ull << b;
+@@ -306,13 +350,12 @@ - (void)recompute {
+     if (changed || stick || _stickShown) [self refresh];   // also refresh on the stick release so the knob returns to the centre
+     _stickShown = stick;
+ }
+-// Touches no control takes (all of them while a physical controller is connected) go to the game's touch screen, normalized on the 16:9 picture that front_ios.m
+-// centres in the screen: Super Mario Galaxy's pointer in handheld mode (profile op_mode). The host reports them only in handheld mode, as on the Switch (hle_hid.c touch_read)
++// Touches no control takes (all of them while a physical controller is connected) go to the game's touch screen,
++// normalized on the picture, including the part clipped when it fills the screen.
+ - (void)pushGame {
+-    CGRect b = self.bounds; CGFloat w = b.size.width, h = b.size.height;
++    CGRect b = self.picture; CGFloat w = b.size.width, h = b.size.height;
+     if (w <= 0 || h <= 0) return;
+-    if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
+-    CGFloat x0 = (b.size.width - w) / 2, y0 = (b.size.height - h) / 2;
++    CGFloat x0 = b.origin.x, y0 = b.origin.y;
+     dm_touch t[16]; int n = 0;
+     for (int i = 0; i < 16; i++) if (_game[i]) {
+         CGPoint p = [_game[i] locationInView:self];
+@@ -373,7 +416,8 @@ - (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {
+ }
+ - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
+ - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
+-- (void)reset { [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
++- (void)reset { _gestureEpoch++; _gestureReady = 0; pthread_mutex_lock(&g_mu); g_gesture_btn = 0; pthread_mutex_unlock(&g_mu);
++    [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
+ 
+ // ---- Shapes ----
+ static CGPathRef circlePath(CGPoint c, CGFloat r) { return CGPathCreateWithEllipseInRect(CGRectMake(c.x - r, c.y - r, 2 * r, 2 * r), NULL); }
+@@ -521,6 +565,9 @@ - (void)padsChanged:(NSNotification *)note {
+ @end
+ 
+ UIView *dm_gamepad_view(CGRect frame) { DmGamepad *v = [[DmGamepad alloc] initWithFrame:frame]; g_view = v; return v; }
++void dm_gamepad_set_picture(UIView *view, CGRect picture) {
++    ((DmGamepad *)view).picture = picture;
++}
+ void dm_gamepad_reset(void) {   // On resign active: release everything (a key held while switching away and released in background gets no "release")
+     dispatch_async(dispatch_get_main_queue(), ^{ [g_view reset]; });
+     pthread_mutex_lock(&g_mu); g_shake_btn = 0; pthread_mutex_unlock(&g_mu); publish();
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 45aa526..4219eeb 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -1,16 +1,19 @@
+-// iOS front end (the iOS implementation of front.h): a centered 16:9 Metal view (black bars on both sides) + a full-screen virtual gamepad layer (DmGamepad.m, controls drawn over the picture).
++// iOS front end (the iOS implementation of front.h): a centered 16:9 Metal view and a full-screen virtual gamepad layer (DmGamepad.m, controls drawn over the picture).
+ // The host runs on the big-stack thread started by main.m; front_run runs the guest directly on the calling thread.
+ #import <UIKit/UIKit.h>
+ #import <QuartzCore/CAMetalLayer.h>
+ #import <Metal/Metal.h>
++#import <MetalFX/MetalFX.h>
+ #import <AVFAudio/AVFAudio.h>
+ #include <errno.h>
+ #include "front.h"
+ #include "hle.h"
+ #include "dm.h"
+ #include "haptics_apple.h"
++#include "nvn_mtl.h"
+ 
+ UIView *dm_gamepad_view(CGRect frame);
++void dm_gamepad_set_picture(UIView *view, CGRect picture);
+ void dm_gamepad_reset(void);
+ void front_ios_boot(void);
+ int front_ios_boot_ok(void);
+@@ -20,7 +23,27 @@
+ static CAMetalLayer *g_layer;
+ static void front_ios_power_watch(void);
+ static void front_ios_audio_watch(void);
+-static UILabel *front_ios_fps_label(void);
++static BOOL front_ios_fps_enabled(void);
++uint64_t mtl_present_count(void);
++
++static NSString *const k_fill_screen = @"FEGraphicsFillScreen";
++static BOOL graphics_use_saved_choices(void) {
++    const char *e = getenv("DM_SAVED_CHOICES");
++    return !e || strcmp(e, "0");
++}
++static BOOL graphics_option_fixed(NSString *key) {
++    for (const char **p = (const char *[]){ "DM_ENV_LAUNCH_KEYS", "DM_ENV_FILE_KEYS", NULL }; *p; ++p) {
++        const char *e = getenv(*p);
++        if (e && [[@(e) componentsSeparatedByString:@" "] containsObject:key]) return YES;
++    }
++    return NO;
++}
++static void graphics_store_launcher_choice(NSString *env, NSString *value, NSString *initial) {
++    if (!graphics_use_saved_choices()) return;
++    NSString *key = [@"launcher." stringByAppendingString:env];
++    if ([value isEqualToString:initial]) [NSUserDefaults.standardUserDefaults removeObjectForKey:key];
++    else [NSUserDefaults.standardUserDefaults setObject:value forKey:key];
++}
+ 
+ @interface DmGameView : UIView
+ @end
+@@ -46,11 +69,20 @@ @interface DmRootVC : UIViewController
+ @property (nonatomic, strong) DmGameView *game;
+ @property (nonatomic, strong) UIView *pad;
+ @property (nonatomic, strong) UILabel *fps;
++@property (nonatomic, strong) NSTimer *fpsTimer;
++@property (nonatomic, strong) UIButton *graphicsButton;
++@property (nonatomic) BOOL fillScreen, metalFX, metalFXSupported;
++@property (nonatomic) int nextOpMode;
+ @property (nonatomic) BOOL launched;
+ - (void)startGame;
++- (void)setFPSCounterEnabled:(BOOL)enabled;
+ @end
+ static DmRootVC *g_root;
+ static void launcher_done(void) { [g_root startGame]; }
++extern void fe_cloud_prepare(void *presenter, const char *profile, void (*completion)(void));
++static void cloud_done(void) {
++    if (!dm_show_launcher((__bridge void *)g_root, launcher_done)) [g_root startGame];
++}
+ @implementation DmRootVC
+ - (void)viewDidLoad {
+     [super viewDidLoad];
+@@ -78,8 +110,8 @@ - (void)startGame {
+     self.pad = dm_gamepad_view(self.view.bounds);
+     self.pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+     [self.view addSubview:self.pad];
+-    self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
+-    if (self.fps) [self.view addSubview:self.fps];
++    [self setFPSCounterEnabled:front_ios_fps_enabled()];
++    if (!strcmp(DM_GAME_ID, "010055D009F78000")) [self installGraphicsButton];
+     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
+     UIApplication.sharedApplication.idleTimerDisabled = YES;
+     front_ios_boot();
+@@ -88,12 +120,140 @@ - (void)viewDidLayoutSubviews {
+     [super viewDidLayoutSubviews];
+     CGRect b = self.view.bounds; if (!self.game) return;
+     CGFloat w = b.size.width, h = b.size.height;   // Fit 16:9 into the whole screen
++    if (w <= 0 || h <= 0) return;
+     if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
+-    self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
++    self.game.bounds = CGRectMake(0, 0, w, h);
++    self.game.center = CGPointMake(floor((b.size.width - w) / 2) + w / 2, floor((b.size.height - h) / 2) + h / 2);
++    // Fill is a uniform crop after presentation. It leaves the Metal drawable and the game's render resolution alone.
++    CGFloat zoom = self.fillScreen ? MAX(b.size.width / w, b.size.height / h) : 1;
++    self.game.transform = CGAffineTransformMakeScale(zoom, zoom);
++    dm_gamepad_set_picture(self.pad, [self.pad convertRect:self.game.bounds fromView:self.game]);
++    CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
+     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
+-        CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
+         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+     }
++    if (self.graphicsButton) {
++        // The empty stretch of the top row between + and R3. The gear has a 44-point hit area.
++        CGFloat left = CGRectGetMidX(b) + 77 * u, right = CGRectGetMaxX(s) - 119 * u;
++        CGFloat center = (left + right) / 2;
++        self.graphicsButton.frame = CGRectMake(floor(center - 22), CGRectGetMinY(s), 44, 44);
++    }
++}
++- (void)installGraphicsButton {
++    self.view.clipsToBounds = YES;
++    self.fillScreen = graphics_use_saved_choices() && [NSUserDefaults.standardUserDefaults boolForKey:k_fill_screen];
++    const char *upscale = getenv("DM_PRESENT_UPSCALE");
++    self.metalFXSupported = [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_layer.device];
++    self.metalFX = self.metalFXSupported && upscale && (!strcmp(upscale, "metalfx") || !strcmp(upscale, "1"));
++    self.nextOpMode = dm_opmode();
++
++    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
++    UIImageSymbolConfiguration *symbol = [UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightSemibold];
++    [button setImage:[UIImage systemImageNamed:@"gearshape" withConfiguration:symbol] forState:UIControlStateNormal];
++    button.tintColor = UIColor.whiteColor;
++    UIView *background = [[UIView alloc] initWithFrame:CGRectMake(7, 7, 30, 30)];
++    background.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
++    background.layer.cornerRadius = 15;
++    background.userInteractionEnabled = NO;
++    [button insertSubview:background atIndex:0];
++    button.accessibilityLabel = @"Настройки графики";
++    button.accessibilityHint = @"Открывает настройки изображения";
++    __weak typeof(self) weakSelf = self;
++    UIDeferredMenuElement *settings = [UIDeferredMenuElement elementWithUncachedProvider:^(void (^complete)(NSArray<UIMenuElement *> *)) {
++        complete([weakSelf graphicsMenuItems] ?: @[]);
++    }];
++    button.menu = [UIMenu menuWithTitle:@"Графика" children:@[settings]];
++    button.showsMenuAsPrimaryAction = YES;
++    [self.view addSubview:button];
++    self.graphicsButton = button;
++}
++static UIAction *graphics_action(NSString *title, BOOL selected, BOOL disabled, UIActionHandler handler) {
++    UIAction *action = [UIAction actionWithTitle:title image:nil identifier:nil handler:handler];
++    action.state = selected ? UIMenuElementStateOn : UIMenuElementStateOff;
++    if (disabled) action.attributes = UIMenuElementAttributesDisabled;
++    return action;
++}
++- (NSArray<UIMenuElement *> *)graphicsMenuItems {
++    __weak typeof(self) weakSelf = self;
++    UIAction *fit = graphics_action(@"Весь кадр 16:9", !self.fillScreen, NO, ^(UIAction *a) { [weakSelf setGraphicsFill:NO]; });
++    UIAction *fill = graphics_action(@"Заполнить с обрезкой", self.fillScreen, NO, ^(UIAction *a) { [weakSelf setGraphicsFill:YES]; });
++    UIMenu *display = [UIMenu menuWithTitle:@"Отображение" children:@[fit, fill]];
++    display.subtitle = self.fillScreen ? @"Заполнение экрана" : @"Весь кадр 16:9";
++
++    BOOL upscaleFixed = graphics_option_fixed(@"DM_PRESENT_UPSCALE");
++    UIAction *standard = graphics_action(@"Обычное", !self.metalFX, upscaleFixed, ^(UIAction *a) { [weakSelf setGraphicsMetalFX:NO]; });
++    UIAction *fx = graphics_action(@"MetalFX", self.metalFX, upscaleFixed || !self.metalFXSupported, ^(UIAction *a) { [weakSelf setGraphicsMetalFX:YES]; });
++    fx.subtitle = self.metalFXSupported ? @"Для увеличения кадра" : @"Недоступно на этом устройстве";
++    UIMenu *upscaling = [UIMenu menuWithTitle:@"Масштабирование" children:@[standard, fx]];
++    upscaling.subtitle = upscaleFixed ? @"Задано при запуске" : self.metalFX ? @"MetalFX при увеличении" : @"Обычное";
++
++    BOOL fpsFixed = graphics_option_fixed(@"DM_SHOW_FPS");
++    UIAction *fps = graphics_action(@"Счётчик FPS", self.fps != nil, fpsFixed, ^(UIAction *a) {
++        DmRootVC *root = weakSelf;
++        if (!root) return;
++        BOOL show = root.fps == nil;
++        [root setFPSCounterEnabled:show];
++        graphics_store_launcher_choice(@"DM_SHOW_FPS", show ? @"1" : @"0", [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue] ? @"1" : @"0");
++    });
++    if (fpsFixed) fps.subtitle = @"Задано при запуске";
++
++    BOOL modeFixed = graphics_option_fixed(@"DM_OPMODE"), modeDisabled = modeFixed || !graphics_use_saved_choices();
++    UIAction *handheld = graphics_action(@"Портативный · 720p", !self.nextOpMode, modeDisabled, ^(UIAction *a) { [weakSelf queueGraphicsOpMode:0]; });
++    UIAction *docked = graphics_action(@"Док-станция · 1080p", self.nextOpMode != 0, modeDisabled, ^(UIAction *a) { [weakSelf queueGraphicsOpMode:1]; });
++    UIMenu *mode = [UIMenu menuWithTitle:@"Режим Switch" children:@[handheld, docked]];
++    if (modeFixed) mode.subtitle = @"Задано при запуске";
++    else if (modeDisabled) mode.subtitle = @"Сохранение настроек отключено";
++    else if (self.nextOpMode != dm_opmode()) mode.subtitle = self.nextOpMode ? @"1080p после перезапуска" : @"720p после перезапуска";
++    else mode.subtitle = @"Меняется после перезапуска";
++    return @[display, upscaling, fps, mode];
++}
++- (void)setGraphicsFill:(BOOL)fill {
++    if (self.fillScreen == fill) return;
++    self.fillScreen = fill;
++    if (graphics_use_saved_choices()) [NSUserDefaults.standardUserDefaults setBool:fill forKey:k_fill_screen];
++    [self.view setNeedsLayout];
++}
++- (void)setGraphicsMetalFX:(BOOL)enabled {
++    self.metalFX = enabled;
++    mtl_present_set_upscale(enabled);
++    graphics_store_launcher_choice(@"DM_PRESENT_UPSCALE", enabled ? @"metalfx" : @"off", @"off");
++}
++- (void)queueGraphicsOpMode:(int)mode {
++    if (self.nextOpMode == mode) return;
++    self.nextOpMode = mode;
++    graphics_store_launcher_choice(@"DM_OPMODE", mode ? @"1" : @"0", DM_GAME_OPMODE ? @"1" : @"0");
++    LOG("front end: console mode %s queued for next launch", mode ? "docked" : "handheld");
++}
++- (void)setFPSCounterEnabled:(BOOL)enabled {
++    if (!enabled) {
++        [self.fpsTimer invalidate]; self.fpsTimer = nil;
++        [self.fps removeFromSuperview]; self.fps = nil;
++        return;
++    }
++    if (self.fps) return;
++    UILabel *label = [UILabel new];
++    label.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold];
++    label.textColor = UIColor.whiteColor;
++    label.textAlignment = NSTextAlignmentCenter;
++    label.backgroundColor = [UIColor colorWithWhite:0 alpha:0.65];
++    label.layer.cornerRadius = 6;
++    label.layer.masksToBounds = YES;
++    label.userInteractionEnabled = NO;
++    label.text = @"– FPS";
++    self.fps = label;
++    [self.view addSubview:label];
++    [self.view setNeedsLayout];
++
++    __block uint64_t lastCount = mtl_present_count();
++    __block double lastTime = CACurrentMediaTime();
++    self.fpsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
++        uint64_t count = mtl_present_count();
++        double now = CACurrentMediaTime();
++        if (now - lastTime < 1.5) label.text = [NSString stringWithFormat:@"%.0f FPS", (count - lastCount) / (now - lastTime)];
++        lastCount = count;
++        lastTime = now;
++    }];
++    LOG("front end: frame-rate counter on");
+ }
+ - (void)viewDidAppear:(BOOL)a {
+     [super viewDidAppear:a];
+@@ -104,7 +264,10 @@ - (void)viewDidAppear:(BOOL)a {
+     }
+     if (self.launched || !front_ios_boot_ok()) return;
+     self.launched = YES; g_root = self;
+-    if (!dm_show_launcher((__bridge void *)self, launcher_done)) [self startGame];   // the settings screen first (Launcher.swift), when the app has one
++    // The committed profile is imported before the guest mounts its save.
++    const char *profile = getenv("DM_SAVE");
++    if (profile) fe_cloud_prepare((__bridge void *)self, profile, cloud_done);
++    else cloud_done();
+ }
+ - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+ - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
+@@ -130,23 +293,10 @@ static void front_ios_power_watch(void) {
+ }
+ 
+ // Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted).
+-// On when the IPA was built with it (the NSP script's SHOW_FPS / --show-fps → DMShowFPS in Info.plist); DM_SHOW_FPS=0 / 1 in Documents/env.txt overrides that without a rebuild. NULL when off
+-uint64_t mtl_present_count(void);
+-static UILabel *front_ios_fps_label(void) {
++// Initial choice from the launcher, launch environment or the IPA's DMShowFPS setting.
++static BOOL front_ios_fps_enabled(void) {
+     const char *e = getenv("DM_SHOW_FPS");
+-    if (!(e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue])) return nil;
+-    UILabel *l = [UILabel new];
+-    l.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
+-    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
+-    l.text = @"-- fps";
+-    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+-    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+-        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
+-        if (now - t0 < 1.5) l.text = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];   // a longer span is the time in the background: no reading
+-        n0 = n; t0 = now;
+-    }];
+-    LOG("front end: frame-rate counter on");
+-    return l;
++    return e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue];
+ }
+ 
+ // Progress screen of the prepare step (front.h front_progress): a dark view over the game's view and the pad, the title, a bar and a count, centered; UIKit views, so it draws while the game's thread waits

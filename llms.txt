@@ -8,6 +8,8 @@
 - [Русская инструкция](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/docs/ru.md): требования, сборка, подпись, iPhone и iCloud.
 - [Agent runbook](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/AGENTS.md): owner-controlled inputs, safety and verification.
 - [Sync format and limits](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/docs/sync.md): version graph, backups and offline races.
+- [BOTW experiments](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/experiments/botw/README.md): controller, touch and display work; see each verification status.
+- [Fire Emblem experiments](https://github.com/omiusgm/switch-mac-iphone-icloud-saves/blob/main/experiments/fire-emblem/README.en.md): separate native-port source work, not a universal save adapter.
 - [Upstream](https://github.com/ly05010419/MacNativeGames): individual game ports.
 
 No game content, keys, firmware, compiled IPA, saves, credentials or personal

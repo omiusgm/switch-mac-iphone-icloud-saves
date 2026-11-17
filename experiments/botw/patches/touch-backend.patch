@@ -1,0 +1,747 @@
+--- a/games/totk/runtime/loader.c
++++ b/games/totk/runtime/loader.c
+@@ -3,6 +3,7 @@
+ #include "totk_ui_lang.h"
+ #include <TargetConditionals.h>
+ #include <dlfcn.h>
++#include <errno.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -21,6 +22,7 @@
+ #include "runtime_tables.h"
+ #include "game_patches.h"
+ #include "game_version.h"
++#include "botw_touch_internal.h"
+ #define NM (sizeof(modules)/sizeof(modules[0]))
+ pthread_key_t runtime_keys[8];
+ static uint64_t timer_calls, svc_calls;
+@@ -66,6 +68,23 @@
+  if(off>=m->key_off)return off>=m->patch_off?5:1;
+  return module_permissions[i]?module_permissions[i][(off-m->data_off)/4096]:3;
+ }
++#if BOTW_TOUCH_ENABLED
++bool runtime_botw_touch_copy_main_pointer(uintptr_t main,unsigned offset,uintptr_t *out){
++ const Module *m=&modules[0];
++ if(!main||main!=(uintptr_t)m->base||!out||offset%sizeof *out||
++    offset<m->data_off||offset>=m->key_off||sizeof *out>m->key_off-offset||
++    main>UINTPTR_MAX-offset) return botw_touch_read_failed(BOTW_TOUCH_MODULE_SLOT);
++ int locked=pthread_mutex_trylock(&module_permission_lock);
++ if(locked) return botw_touch_read_failed(locked==EBUSY ? BOTW_TOUCH_MODULE_BUSY : BOTW_TOUCH_LOCK_ERROR);
++ /* The aligned singleton slot fits in one guest page. Other guest pages can
++    keep its shared Darwin page readable even when this logical page is not. */
++ bool readable=module_page_permission(0,offset&~4095ULL)&1;
++ bool copied=readable ? botw_touch_copy_vm(main+offset,out,sizeof *out)
++                      : botw_touch_read_failed(BOTW_TOUCH_MODULE_SLOT);
++ pthread_mutex_unlock(&module_permission_lock);
++ return copied;
++}
++#endif
+ uint64_t runtime_module_permission(uint64_t address,uint64_t size,unsigned permission){
+  if(address&4095)return 0xcc01;
+  if(!size||(size&4095))return 0xca01;
+@@ -557,5 +576,8 @@
+ #endif
+  verify_identity(!strcmp(argv[2],"probe-identity-negative"));
+  for(unsigned i=0;i<NM;i++){seal(&modules[i]);check_permissions(&modules[i]);}
++#if BOTW_TOUCH_ENABLED
++ if(!strcmp(argv[2],"boot"))botw_touch_set_main((uintptr_t)modules[0].base,modules[0].digest);
++#endif
+  if(!strcmp(argv[2],"probe-gpu-writeback")||!strcmp(argv[2],"probe-gpu-sampler-border")||!strcmp(argv[2],"probe-gpu-pool-retire")||!strcmp(argv[2],"probe-gpu-tex-slots")||!strcmp(argv[2],"probe-gpu-arg-epoch")||!strcmp(argv[2],"probe-gpu-anomaly")||!strcmp(argv[2],"probe-gpu-vertex-streams")||!strcmp(argv[2],"probe-gpu-layer-merge")||!strcmp(argv[2],"probe-gpu-cube-merge")||!strcmp(argv[2],"probe-gpu-texture-retire")||!strcmp(argv[2],"probe-gpu-texels-region")||!strcmp(argv[2],"probe-gpu-linear-rt")||!strcmp(argv[2],"probe-gpu-storage-view")||!strcmp(argv[2],"probe-gpu-compressed-alias")||!strcmp(argv[2],"probe-gpu-upload-batch")||!strcmp(argv[2],"probe-gpu-ds-clear")||!strcmp(argv[2],"probe-gpu-ub-rename")||!strcmp(argv[2],"probe-gpu-ubo-snapshot")||!strcmp(argv[2],"probe-gpu-drv-c0")||!strcmp(argv[2],"probe-gpu-dispatch-chain")||!strcmp(argv[2],"probe-gpu-copy-alias")||!strcmp(argv[2],"probe-gpu-srgb-view")||!strcmp(argv[2],"probe-gpu-depth-output"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-memory"))runtime_memory_probe();else if(!strcmp(argv[2],"probe-gfx"))runtime_gfx_probe(0);else if(!strcmp(argv[2],"probe-vpool"))runtime_vpool_probe();else if(!strcmp(argv[2],"probe-gpu-widen")||!strcmp(argv[2],"probe-gpu-blockrt")||!strcmp(argv[2],"probe-gpu-midclear")||!strcmp(argv[2],"probe-gpu-winding")||!strcmp(argv[2],"probe-gpu-tile"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-audio"))runtime_audio_probe();else if(!strcmp(argv[2],"probe-gfx-negative"))runtime_gfx_probe(1);else if(!strcmp(argv[2],"probe"))probe();else if(!strcmp(argv[2],"probe-fs"))runtime_fs_probe();else if(!strcmp(argv[2],"probe-swkbd"))runtime_swkbd_probe();else if(!strcmp(argv[2],"probe-save"))runtime_save_probe();else if(!strcmp(argv[2],"boot")){if(getenv("TOTK_VERIFY_STARTUP")||getenv("TOTK_HEADLESS"))boot();else runtime_front_run(boot);}else runtime_fail("unknown mode");return 0;
+ }
+--- a/games/totk/runtime/services.c
++++ b/games/totk/runtime/services.c
+@@ -9,6 +9,7 @@
+ #include <stdlib.h>
+ #include <stdatomic.h>
+ #include <ctype.h>
++#include <errno.h>
+ #include "game_language.h"
+ #include <string.h>
+ #include <sys/mman.h>
+@@ -16,6 +17,7 @@
+ #include <time.h>
+ #include <unistd.h>
+ #include <mach/mach_time.h>
++#include "botw_touch_internal.h"
+ /* Guest address layout. The SDK encodes IPC buffer addresses with 39 bits (HIPC descriptor bits 36..38),
+    so all guest memory must lie below 2^39. Darwin arm64 keeps 0x10_0000_0000..0x70_0000_0000 reserved,
+    leaving exactly 64 GiB at 0x70_0000_0000 for the alias region (the real 39-bit Horizon size, which the
+@@ -47,6 +49,9 @@
+ #define STACK_SIZE 0x10000000ULL
+ #define HEAP_OFF (STACK_OFF+STACK_SIZE+0x10000000ULL)
+ static uint8_t *alias_space,*low_space,*heap;
++#if BOTW_TOUCH_ENABLED
++static _Atomic int touch_memory_ready;
++#endif
+ static size_t heap_size;
+ static unsigned char alias_pages[ALIAS_SIZE_MAX/4096];
+ /* 4 KiB guest pages that are unmapped but whose host 16 KiB page is still committed with old contents: only these are
+@@ -148,6 +153,9 @@
+  }
+ #endif
+  heap=low_space+HEAP_OFF;
++#if BOTW_TOUCH_ENABLED
++ atomic_store_explicit(&touch_memory_ready,1,memory_order_release);
++#endif
+  fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);
+ }
+ /* Scoped stack moves: independent host backing, copy back on unmap.
+@@ -157,6 +165,32 @@
+ static pthread_mutex_t memory_lock=PTHREAD_MUTEX_INITIALIZER;
+ typedef struct{uint64_t dst,src,size;} StackMap;static StackMap stack_maps[4096];static unsigned nstack_maps;
+ static int overlaps(uint64_t a,uint64_t n,uint64_t b,uint64_t m){return a<b+m&&b<a+n;}
++#if BOTW_TOUCH_ENABLED
++bool runtime_botw_touch_copy_data(uintptr_t address,void *out,size_t size){
++ if(!size||size>BOTW_TOUCH_MAX_COPY||!out)
++    return botw_touch_read_failed(BOTW_TOUCH_DATA_RANGE);
++ if(!atomic_load_explicit(&touch_memory_ready,memory_order_acquire))
++    return botw_touch_read_failed(BOTW_TOUCH_RUNTIME_UNAVAILABLE);
++ uintptr_t alias=(uintptr_t)alias_space;
++ bool in_alias=botw_touch_range_contains(address,size,alias,alias_len);
++ if(!in_alias&&!botw_touch_range_contains(address,size,(uintptr_t)heap,HEAP_CAP))
++    return botw_touch_read_failed(BOTW_TOUCH_DATA_RANGE);
++ int locked=pthread_mutex_trylock(&memory_lock);
++ if(locked) return botw_touch_read_failed(locked==EBUSY ? BOTW_TOUCH_MEMORY_BUSY : BOTW_TOUCH_LOCK_ERROR);
++ /* A decommitted logical 4 KiB page can share a readable 16 KiB Darwin page.
++    Consult alias_pages while its mappings are locked, and reject moved stacks. */
++ bool readable=!in_alias||botw_touch_alias_pages_present(alias_pages,sizeof alias_pages,address-alias,size);
++ if(!readable) botw_touch_read_failed(BOTW_TOUCH_DATA_UNMAPPED);
++ for(unsigned i=0;readable&&i<nstack_maps;i++)
++  if(overlaps(address,size,stack_maps[i].src,stack_maps[i].size))
++     readable=botw_touch_read_failed(BOTW_TOUCH_DATA_MOVED);
++ /* A heap shrink is independent of this lock, but protects whole pages.
++    The kernel's bounded read returns failure on an unmapped/protected page. */
++ bool copied=readable&&botw_touch_copy_vm(address,out,size);
++ pthread_mutex_unlock(&memory_lock);
++ return copied;
++}
++#endif
+ static uint64_t stack_move(int unmap,uint64_t dst,uint64_t src,uint64_t size){
+  if(!size||((dst|src|size)&4095))return 0xcc01;
+  if(dst<STACK_START||size>STACK_SIZE||dst-STACK_START>STACK_SIZE-size)return 0xdc01;
+--- a/games/totk/runtime/romfs.c
++++ b/games/totk/runtime/romfs.c
+@@ -5,6 +5,7 @@
+ #include "game_version.h"
+ #include "fs_host.h"
+ #include "romfs_path.h"
++#include "botw_touch_internal.h"
+ #include <CommonCrypto/CommonDigest.h>
+ #include <TargetConditionals.h>
+ #include <fcntl.h>
+@@ -39,6 +40,9 @@
+ }
+ static const uint8_t *image_map;
+ static char mount_name[32];
++#if BOTW_TOUCH_ENABLED
++static _Atomic int touch_romfs_ready;
++#endif
+ static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+ static _Atomic uint64_t read_calls,read_bytes,read_ns,read_prepare_ns,read_report_ns;
+ static uint64_t handles[NH]; /* file index + 1; 0 is free */
+@@ -272,6 +276,9 @@
+  }
+  runtime_boot_status(TOTK_UI("准备游戏资源","Preparing game data"),TOTK_UI("检查分辨率补丁并挂载只读游戏资源","Checking the resolution patch and mounting the read-only game data"));
+  overlay_init();
++#if BOTW_TOUCH_ENABLED
++ atomic_store_explicit(&touch_romfs_ready,1,memory_order_release);
++#endif
+  fprintf(stderr,"[totk] native read-only RomFS ready: %llu files\n",(unsigned long long)file_count);
+ }
+ static int path_ok(const char *p) {return romfs_path_valid_relative(p);}
+@@ -279,6 +286,28 @@
+  return romfs_path_relative(mount_name,path);
+ }
+ static uint64_t lower(const char *name) {uint64_t lo=0,hi=file_count;while(lo<hi){uint64_t m=lo+(hi-lo)/2;if(strcmp(entry_name(entry(m)),name)<0)lo=m+1;else hi=m;}return lo;}
++#if BOTW_TOUCH_ENABLED
++/* Optional HUD art uses the original image. It never opens a guest handle,
++   follows an overlay or needs the mount name. An I/O failure only hides art. */
++size_t runtime_romfs_read_stock_item(const char *name,uint8_t *out,size_t capacity){
++ static const char folder[]="UI/StockItem/";
++ if(!name||!out||!capacity||strncmp(name,folder,sizeof folder-1)||
++    !path_ok(name)||strchr(name+sizeof folder-1,'/')||
++    !atomic_load_explicit(&touch_romfs_ready,memory_order_acquire))return 0;
++ uint64_t i=lower(name);if(i==file_count)return 0;
++ Entry e=entry(i);
++ if(strcmp(name,entry_name(e))||!e.size||e.size>capacity||e.size>BOTW_TOUCH_MAX_STOCK_ITEM||
++    e.offset>ROMFS_IMAGE_SIZE||e.size>ROMFS_IMAGE_SIZE-e.offset)return 0;
++ size_t done=0;
++ for(unsigned attempt=0;done<e.size&&attempt<16;attempt++){
++  ssize_t got=src_pread(image_fd,out+done,(size_t)e.size-done,(off_t)(e.offset+done));
++  if(got<0&&errno==EINTR)continue;
++  if(got<=0)return 0;
++  done+=(size_t)got;
++ }
++ return done==e.size?done:0;
++}
++#endif
+ static unsigned mount_rom(const char *name,void *cache,uint64_t size) {
+  (void)cache;(void)size;runtime_fs_init();if(!name||!path_ok(name)||strlen(name)>=sizeof(mount_name)||strchr(name,'/')||strchr(name,':'))return INVALID;
+  if(*mount_name&&strcmp(name,mount_name))runtime_fail("second RomFS mount not implemented");strcpy(mount_name,name);return 0;
+--- /dev/null
++++ b/games/totk/runtime/botw_touch.h
+@@ -0,0 +1,55 @@
++/* Read-only iOS BOTW 1.6.0 touch HUD. Call snapshot and icon on the same serial worker queue. */
++#pragma once
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum {
++    BOTW_TOUCH_SWORD, BOTW_TOUCH_BOW, BOTW_TOUCH_SHIELD, BOTW_TOUCH_ARROWS,
++    BOTW_TOUCH_EQUIPMENT_COUNT
++};
++enum { BOTW_TOUCH_RUNE_COUNT = 8, BOTW_TOUCH_ACTOR_CAP = 64 };
++
++typedef struct {
++    bool equipment_known, owned_runes_known;
++    int selected_rune;    /* -1 while the game state is unavailable */
++    uint8_t owned_runes;  /* Valid even when zero, if owned_runes_known */
++    char equipped[BOTW_TOUCH_EQUIPMENT_COUNT][BOTW_TOUCH_ACTOR_CAP];
++} BOTWTouchSnapshot;
++
++typedef struct {
++    unsigned width, height;
++    uint8_t *rgba;         /* Straight-alpha RGBA8. Caller frees with free(). */
++} BOTWTouchIcon;
++
++typedef enum {
++    BOTW_TOUCH_RUNTIME_UNAVAILABLE,
++    BOTW_TOUCH_MODULE_SLOT,
++    BOTW_TOUCH_MODULE_BUSY,
++    BOTW_TOUCH_MEMORY_BUSY,
++    BOTW_TOUCH_LOCK_ERROR,
++    BOTW_TOUCH_DATA_RANGE,
++    BOTW_TOUCH_DATA_UNMAPPED,
++    BOTW_TOUCH_DATA_MOVED,
++    BOTW_TOUCH_VM_COPY,
++    BOTW_TOUCH_GDT_LAYOUT,
++    BOTW_TOUCH_FLAG_TYPE,
++    BOTW_TOUCH_FLAG_MISSING,
++    BOTW_TOUCH_SELECTION_RANGE,
++    BOTW_TOUCH_UNSTABLE,
++    BOTW_TOUCH_REASON_COUNT
++} BOTWTouchReason;
++
++void botw_touch_snapshot(BOTWTouchSnapshot *out);
++/* Diagnostic bits describe the rune reads only, excluding equipment. */
++void botw_touch_snapshot_diagnostic(BOTWTouchSnapshot *out, uint32_t *reasons);
++
++const char *botw_touch_rune_actor(unsigned rune);
++bool botw_touch_icon(const char *actor, BOTWTouchIcon *out);
++
++#ifdef __cplusplus
++}
++#endif
+--- /dev/null
++++ b/games/totk/runtime/botw_touch_icons.c
+@@ -0,0 +1,155 @@
++#include "botw_touch_internal.h"
++#include "botw_touch_license.h"
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++const char *botw_touch_rune_actor(unsigned rune) {
++    static const char *const actors[BOTW_TOUCH_RUNE_COUNT] = {
++        "Obj_RemoteBombBall", "Obj_RemoteBombCube", "Obj_Magnetglove", "Obj_StopTimer",
++        "Obj_IceMaker", "Obj_Camera", "Obj_Motorcycle", "Obj_AmiiboItem"
++    };
++    return rune < BOTW_TOUCH_RUNE_COUNT ? actors[rune] : NULL;
++}
++
++bool botw_touch_valid_actor(const char *actor) {
++    if (!actor || !*actor) return false;
++    for (unsigned i = 0; i < BOTW_TOUCH_ACTOR_CAP; i++) {
++        unsigned char c = actor[i];
++        if (!c) return true;
++        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++              (c >= '0' && c <= '9') || c == '_')) return false;
++    }
++    return false;
++}
++
++/* StockItem files observed in the base game are below 56 KiB compressed.
++   The expanded files are FRES containers with one small block-linear RGBA8 texture. */
++#define MAX_EXPANDED (512u * 1024u)
++#define MAX_ICON_SIDE 256u
++static uint8_t *yaz0(const uint8_t *input, size_t length, size_t *decoded_size) {
++    if (length < 16 || length > BOTW_TOUCH_MAX_STOCK_ITEM || memcmp(input, "Yaz0", 4))
++        return NULL;
++    size_t size = (size_t)input[4] << 24 | (size_t)input[5] << 16 |
++                  (size_t)input[6] << 8 | input[7];
++    if (!size || size > MAX_EXPANDED) return NULL;
++    uint8_t *output = malloc(size);
++    if (!output) return NULL;
++    size_t read_at = 16, write_at = 0;
++    while (write_at < size) {
++        if (read_at == length) goto invalid;
++        uint8_t code = input[read_at++];
++        for (unsigned bit = 0; bit < 8 && write_at < size; bit++, code <<= 1) {
++            if (code & 0x80) {
++                if (read_at == length) goto invalid;
++                output[write_at++] = input[read_at++];
++                continue;
++            }
++            if (length - read_at < 2) goto invalid;
++            unsigned first = input[read_at++], second = input[read_at++];
++            size_t distance = ((first & 0xf) << 8 | second) + 1;
++            size_t count = first >> 4;
++            if (count) count += 2;
++            else {
++                if (read_at == length) goto invalid;
++                count = (size_t)input[read_at++] + 0x12;
++            }
++            if (distance > write_at || count > size - write_at) goto invalid;
++            while (count--) {
++                output[write_at] = output[write_at - distance];
++                write_at++;
++            }
++        }
++    }
++    *decoded_size = size;
++    return output;
++invalid:
++    free(output);
++    return NULL;
++}
++
++static uint32_t le32(const uint8_t *p) {
++    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint64_t le64(const uint8_t *p) {
++    return le32(p) | (uint64_t)le32(p + 4) << 32;
++}
++
++static bool contains(size_t size, uint64_t offset, size_t length) {
++    return offset <= size && length <= size - offset;
++}
++
++static bool bntx_rgba(const uint8_t *file, size_t size, BOTWTouchIcon *out) {
++    while (size >= 0x30 && memcmp(file, "BNTX\0\0\0\0", 8)) {
++        ++file;
++        --size;
++    }
++    if (size < 0x30 || file[0xc] != 0xff || file[0xd] != 0xfe) return false;
++    uint64_t entries = le64(file + 0x28);
++    if (!contains(size, entries, 8)) return false;
++    uint64_t texture = le64(file + entries);
++    if (!contains(size, texture, 0x78) || memcmp(file + texture, "BRTI", 4)) return false;
++    const uint8_t *info = file + texture;
++    unsigned format = le32(info + 0x1c), block_height = le32(info + 0x34);
++    unsigned width = le32(info + 0x24), height = le32(info + 0x28);
++    if ((format >> 8) != 0x0b || !width || !height ||
++        width > MAX_ICON_SIDE || height > MAX_ICON_SIDE || block_height > 5) return false;
++
++    uint64_t mip_table = le64(info + 0x70);
++    if (!contains(size, mip_table, 8)) return false;
++    uint64_t data = le64(file + mip_table);
++    unsigned pitch = width * 4, gobs_per_row = (pitch + 63) / 64;
++    if (!contains(size, data, (size_t)pitch * height)) return false;
++    uint8_t *pixels = malloc((size_t)pitch * height);
++    if (!pixels) return false;
++
++    /* Tegra GOB layout, x in bytes. This matches the upstream decoder's transform. */
++    for (unsigned y = 0; y < height; y++) {
++        unsigned gy = y >> 3;
++        for (unsigned x = 0; x < pitch; x++) {
++            size_t address = ((gy >> block_height) * gobs_per_row + (x >> 6)) * (512u << block_height) +
++                (gy & ((1u << block_height) - 1)) * 512u + ((x & 63) >> 5) * 256u +
++                ((y & 7) >> 1) * 64u + (((x & 63) >> 4) & 1) * 32u + (y & 1) * 16u + (x & 15);
++            if (address >= size - data) {
++                free(pixels);
++                return false;
++            }
++            pixels[(size_t)y * pitch + x] = file[data + address];
++        }
++    }
++    *out = (BOTWTouchIcon){ .width = width, .height = height, .rgba = pixels };
++    return true;
++}
++
++bool botw_touch_decode_icon(const uint8_t *raw, size_t size, BOTWTouchIcon *out) {
++    if (!out) return false;
++    *out = (BOTWTouchIcon){0};
++    if (!raw) return false;
++    size_t decoded_size = 0;
++    uint8_t *decoded = yaz0(raw, size, &decoded_size);
++    if (!decoded) return false;
++    bool result = bntx_rgba(decoded, decoded_size, out);
++    free(decoded);
++    return result;
++}
++
++bool botw_touch_icon(const char *actor, BOTWTouchIcon *out) {
++    if (!out) return false;
++    *out = (BOTWTouchIcon){0};
++#if BOTW_TOUCH_ENABLED
++    if (pthread_main_np() || !botw_touch_valid_actor(actor)) return false;
++    char name[sizeof("UI/StockItem/.sbitemico") + BOTW_TOUCH_ACTOR_CAP - 1];
++    snprintf(name, sizeof name, "UI/StockItem/%s.sbitemico", actor);
++    uint8_t *raw = malloc(BOTW_TOUCH_MAX_STOCK_ITEM);
++    if (!raw) return false;
++    size_t size = runtime_romfs_read_stock_item(name, raw, BOTW_TOUCH_MAX_STOCK_ITEM);
++    bool decoded = botw_touch_decode_icon(raw, size, out);
++    free(raw);
++    return decoded;
++#else
++    (void)actor;
++    return false;
++#endif
++}
+--- /dev/null
++++ b/games/totk/runtime/botw_touch_internal.h
+@@ -0,0 +1,38 @@
++#pragma once
++#include "botw_touch.h"
++#include <stddef.h>
++#include <TargetConditionals.h>
++
++#if defined(GAME_BOTW160) && TARGET_OS_IOS
++#define BOTW_TOUCH_ENABLED 1
++#else
++#define BOTW_TOUCH_ENABLED 0
++#endif
++#define BOTW_TOUCH_MAX_COPY 128
++#define BOTW_TOUCH_MAX_STOCK_ITEM (128u * 1024u)
++
++static inline bool botw_touch_range_contains(uintptr_t address, size_t size,
++                                             uintptr_t base, uint64_t length) {
++    return base && size && size <= length && address >= base && address - base <= length - size;
++}
++
++/* The caller holds the guest mapping lock across this check and the VM copy. */
++static inline bool botw_touch_alias_pages_present(const uint8_t *pages, size_t page_count,
++                                                  size_t offset, size_t size) {
++    if (!size || offset > SIZE_MAX - (size - 1)) return false;
++    size_t first = offset / 4096, last = (offset + size - 1) / 4096;
++    if (last >= page_count) return false;
++    for (size_t page = first; page <= last; page++)
++        if (!pages[page]) return false;
++    return true;
++}
++
++/* The parser reads only into host-owned buffers. Returns false for any unreadable byte. */
++bool botw_touch_read_failed(BOTWTouchReason reason);
++bool botw_touch_copy_vm(uintptr_t address, void *out, size_t size);
++bool runtime_botw_touch_copy_main_pointer(uintptr_t main, unsigned offset, uintptr_t *out);
++bool runtime_botw_touch_copy_data(uintptr_t address, void *out, size_t size);
++void botw_touch_set_main(uintptr_t base, const char *rewrite_digest);
++bool botw_touch_valid_actor(const char *actor);
++size_t runtime_romfs_read_stock_item(const char *name, uint8_t *out, size_t capacity);
++bool botw_touch_decode_icon(const uint8_t *raw, size_t size, BOTWTouchIcon *out);
+--- /dev/null
++++ b/games/totk/runtime/botw_touch_license.h
+@@ -0,0 +1,28 @@
++/*
++ * The layout constants and algorithms in botw_touch_state.c and botw_touch_icons.c
++ * adapt BOTWRecompAndroid runtime/hle/pouch.c, runtime/hle/gdt_runes.c and
++ * runtime/ui/touch_controls.mm at 3d9beeb0c25c65845e805c91c4bba1bbb860cae9.
++ * https://github.com/mamcjr/BOTWRecompAndroid/tree/3d9beeb0c25c65845e805c91c4bba1bbb860cae9
++ *
++ * MIT License
++ *
++ * Copyright (c) 2026 Peiikai
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
+--- /dev/null
++++ b/games/totk/runtime/botw_touch_state.c
+@@ -0,0 +1,275 @@
++#include "botw_touch_internal.h"
++#include "botw_touch_license.h"
++#if BOTW_TOUCH_ENABLED || defined(BOTW_TOUCH_TEST)
++#include <pthread.h>
++#include <stdatomic.h>
++#include <string.h>
++#include <mach/mach.h>
++#include "mach_vm_compat.h"
++
++/* The NSO build ID 8e9978d50bdd20b4c8395a106c27ffde is represented in this loader by
++   the verified runtime-table digest of the local rewrite. Offsets are relative to
++   the main module; its actual iOS base is chosen by Darwin. */
++#define BOTW160_MAIN_DIGEST "c41ac2fa9be737f2e6b0ab641508e9a51995b03463ff6aa445ce04e5e8766a8e"
++#define POUCH_INSTANCE 0x2ca6d50u
++#define GDT_INSTANCE 0x2cd1700u
++
++static _Atomic uintptr_t game_main;
++static _Thread_local uint32_t *rune_reasons;
++
++bool botw_touch_read_failed(BOTWTouchReason reason) {
++    if (rune_reasons) *rune_reasons |= 1u << reason;
++    return false;
++}
++
++void botw_touch_set_main(uintptr_t base, const char *rewrite_digest) {
++    bool verified = rewrite_digest && !strcmp(rewrite_digest, BOTW160_MAIN_DIGEST) &&
++                    base && !(base & 7) && base <= UINTPTR_MAX - GDT_INSTANCE - sizeof(uint64_t);
++    atomic_store_explicit(&game_main, verified ? base : 0, memory_order_release);
++}
++
++bool botw_touch_copy_vm(uintptr_t address, void *out, size_t size) {
++    if (!address || !out || !size || size > BOTW_TOUCH_MAX_COPY || address > UINTPTR_MAX - size)
++        return false;
++    mach_vm_size_t got = 0;
++    return (mach_vm_read_overwrite(mach_task_self(), address, size, (uintptr_t)out, &got) ==
++            KERN_SUCCESS && got == size) || botw_touch_read_failed(BOTW_TOUCH_VM_COPY);
++}
++
++/* PauseMenuDataMgr and PouchItem layouts from the upstream 1.6.0 pouch reader. */
++enum {
++    POUCH_LIST = 0x68, POUCH_ITEMS = 0x98, ITEM_STRIDE = 0x298, POUCH_MAX = 420,
++    ITEM_NODE = 0x8, ITEM_TYPE = 0x18, ITEM_EQUIPPED = 0x24, ITEM_NAME = 0x3c
++};
++
++typedef struct { uint64_t prev, next; int32_t count, node_offset; } PouchList;
++typedef struct { uintptr_t instance; PouchList list; char equipped[4][64]; } EquipmentSample;
++_Static_assert(sizeof(PouchList) == 0x18 && ITEM_NAME + BOTW_TOUCH_ACTOR_CAP <= BOTW_TOUCH_MAX_COPY,
++               "pouch layout");
++
++static uint32_t read32(const uint8_t *bytes) {
++    uint32_t value;
++    memcpy(&value, bytes, sizeof value);
++    return value;
++}
++
++static uint64_t read64(const uint8_t *bytes) {
++    uint64_t value;
++    memcpy(&value, bytes, sizeof value);
++    return value;
++}
++
++static bool guest_data(uintptr_t address, void *out, size_t size) {
++    if (address & 7) return botw_touch_read_failed(BOTW_TOUCH_GDT_LAYOUT);
++    return runtime_botw_touch_copy_data(address, out, size);
++}
++
++static bool sample_equipment(uintptr_t main, EquipmentSample *sample) {
++    if (!runtime_botw_touch_copy_main_pointer(main, POUCH_INSTANCE, &sample->instance) || !sample->instance ||
++        sample->instance > UINTPTR_MAX - POUCH_ITEMS - POUCH_MAX * ITEM_STRIDE) return false;
++
++    uintptr_t head = sample->instance + POUCH_LIST;
++    uintptr_t first_item = sample->instance + POUCH_ITEMS;
++    PouchList *list = &sample->list;
++    if (!guest_data(head, list, sizeof *list) || list->node_offset != ITEM_NODE ||
++        list->count < 0 || list->count > POUCH_MAX) return false;
++
++    uintptr_t previous = head, node = list->next;
++    for (int index = 0; index < list->count; index++) {
++        if (node < first_item + ITEM_NODE) return false;
++        uintptr_t item = node - ITEM_NODE, offset = item - first_item;
++        if (offset >= POUCH_MAX * ITEM_STRIDE || offset % ITEM_STRIDE) return false;
++
++        uint8_t data[ITEM_NAME + BOTW_TOUCH_ACTOR_CAP];
++        if (!guest_data(item, data, sizeof data) || read64(data + ITEM_NODE) != previous)
++            return false;
++        unsigned type = read32(data + ITEM_TYPE);
++        if (type <= 3) {
++            static const unsigned slot_for_type[] = {
++                BOTW_TOUCH_SWORD, BOTW_TOUCH_BOW, BOTW_TOUCH_ARROWS, BOTW_TOUCH_SHIELD
++            };
++            unsigned slot = slot_for_type[type];
++            if (data[ITEM_EQUIPPED] > 1) return false;
++            if (data[ITEM_EQUIPPED]) {
++                const char *actor = (const char *)data + ITEM_NAME;
++                if (sample->equipped[slot][0] || !botw_touch_valid_actor(actor)) return false;
++                memcpy(sample->equipped[slot], actor, strlen(actor) + 1);
++            }
++        }
++        previous = node;
++        node = read64(data + ITEM_NODE + 8);
++    }
++
++    PouchList end;
++    uintptr_t current;
++    return node == head && previous == list->prev &&
++           guest_data(head, &end, sizeof end) && !memcmp(&end, list, sizeof end) &&
++           runtime_botw_touch_copy_main_pointer(main, POUCH_INSTANCE, &current) &&
++           current == sample->instance;
++}
++
++static bool equipment_matches(const EquipmentSample *first, const EquipmentSample *second) {
++    return first->instance == second->instance &&
++           !memcmp(&first->list, &second->list, sizeof first->list) &&
++           !memcmp(first->equipped, second->equipped, sizeof first->equipped);
++}
++
++/* The live TriggerParam is Manager::mFlagBuffer. In the 1.6.0 constructor,
++   main+0x183f754 wires the +0xc00 field into both TriggerParamRefs. */
++enum {
++    GDT_LIVE = 0xc00, GDT_BOOL_ARRAY = 0x08, GDT_S32_ARRAY = 0x18,
++    GDT_FLAG_TYPE = 0x08, GDT_BOOL_VALUE = 0x0b, GDT_BOOL_HASH = 0x0c,
++    GDT_S32_VALUE = 0x18, GDT_S32_HASH = 0x1c, GDT_FLAGS_MAX = 400000
++};
++
++static const uint32_t rune_selected_hash = 0xa439d800u; /* PlayerEquipItemType in 1.6.0 GameData */
++static const uint32_t rune_owned_hash[BOTW_TOUCH_RUNE_COUNT] = {
++    0x191bccf9, 0x3e4a4bd5, 0x795e7bbc, 0x7504085d,
++    0x5992b256, 0xf7dd3e03, 0xc9328299, 0x89ebcae4
++};
++
++typedef struct { int32_t count, capacity; uintptr_t pointers; } FlagArray;
++typedef struct {
++    uintptr_t instance, live;
++    FlagArray bools, s32s;
++    int selected;
++    uint8_t owned;
++    bool owned_known;
++} RuneSample;
++
++_Static_assert(sizeof(FlagArray) == 16, "gdt pointer array layout");
++
++static bool array_valid(FlagArray array) {
++    return array.count > 0 && array.count <= array.capacity && array.capacity <= GDT_FLAGS_MAX &&
++           array.pointers && !(array.pointers & 7) &&
++           (size_t)array.count * sizeof(uintptr_t) <= UINTPTR_MAX - array.pointers;
++}
++
++static bool flag_at(FlagArray array, unsigned index, bool s32, uint32_t *hash, uint32_t *value) {
++    uintptr_t flag;
++    uint8_t bytes[GDT_S32_HASH + sizeof(uint32_t)];
++    size_t size = s32 ? sizeof bytes : GDT_BOOL_HASH + sizeof(uint32_t);
++    if (index >= (unsigned)array.count ||
++        !guest_data(array.pointers + index * sizeof flag, &flag, sizeof flag) ||
++        !guest_data(flag, bytes, size)) return false;
++    if (bytes[GDT_FLAG_TYPE] != (s32 ? 1 : 0)) return botw_touch_read_failed(BOTW_TOUCH_FLAG_TYPE);
++    *hash = read32(bytes + (s32 ? GDT_S32_HASH : GDT_BOOL_HASH));
++    /* The other bits in a FlagBool encode its category. */
++    *value = s32 ? read32(bytes + GDT_S32_VALUE) : bytes[GDT_BOOL_VALUE] & 1u;
++    return true;
++}
++
++/* Cache indices only. Re-resolve and verify the flag's type/hash on every read.
++   TriggerParam sorts each PtrArray by unsigned CRC32 (same search as the game). */
++static bool find_flag(FlagArray array, bool s32, uint32_t wanted, unsigned *cached, uint32_t *value) {
++    if (!array_valid(array)) return botw_touch_read_failed(BOTW_TOUCH_GDT_LAYOUT);
++    uint32_t hash;
++    if (flag_at(array, *cached, s32, &hash, value) && hash == wanted) return true;
++    unsigned lo = 0, hi = (unsigned)array.count;
++    while (lo < hi) {
++        unsigned mid = lo + (hi - lo) / 2;
++        if (!flag_at(array, mid, s32, &hash, value)) return false;
++        if (hash == wanted) {
++            *cached = mid;
++            return true;
++        }
++        if (hash < wanted) lo = mid + 1;
++        else hi = mid;
++    }
++    return botw_touch_read_failed(BOTW_TOUCH_FLAG_MISSING);
++}
++
++static bool sample_runes(uintptr_t main, RuneSample *sample) {
++    static unsigned selected_index, owned_indices[BOTW_TOUCH_RUNE_COUNT];
++    FlagArray arrays[2], end[2];
++    sample->selected = -1;
++    if (!runtime_botw_touch_copy_main_pointer(main, GDT_INSTANCE, &sample->instance)) return false;
++    if (!sample->instance) return botw_touch_read_failed(BOTW_TOUCH_RUNTIME_UNAVAILABLE);
++    if (sample->instance > UINTPTR_MAX - GDT_LIVE) return botw_touch_read_failed(BOTW_TOUCH_GDT_LAYOUT);
++    if (!guest_data(sample->instance + GDT_LIVE, &sample->live, sizeof sample->live)) return false;
++    if (!sample->live) return botw_touch_read_failed(BOTW_TOUCH_RUNTIME_UNAVAILABLE);
++    if (sample->live > UINTPTR_MAX - GDT_S32_ARRAY) return botw_touch_read_failed(BOTW_TOUCH_GDT_LAYOUT);
++    if (!guest_data(sample->live + GDT_BOOL_ARRAY, arrays, sizeof arrays)) return false;
++    sample->bools = arrays[0];
++    sample->s32s = arrays[1];
++
++    uint32_t value;
++    if (!find_flag(sample->s32s, true, rune_selected_hash, &selected_index, &value)) return false;
++    if (value < BOTW_TOUCH_RUNE_COUNT) sample->selected = (int)value;
++    else botw_touch_read_failed(BOTW_TOUCH_SELECTION_RANGE);
++
++    sample->owned_known = true;
++    for (unsigned rune = 0; rune < BOTW_TOUCH_RUNE_COUNT; rune++) {
++        if (!find_flag(sample->bools, false, rune_owned_hash[rune], &owned_indices[rune], &value)) {
++            sample->owned_known = false;
++            sample->owned = 0;
++            break;
++        }
++        if (value) sample->owned |= 1u << rune;
++    }
++    if (sample->owned & 1u) sample->owned |= 2u; /* both bomb variants unlock together */
++
++    uintptr_t current_live, current_instance;
++    if (!guest_data(sample->live + GDT_BOOL_ARRAY, end, sizeof end)) return false;
++    if (memcmp(arrays, end, sizeof arrays)) return botw_touch_read_failed(BOTW_TOUCH_UNSTABLE);
++    if (!guest_data(sample->instance + GDT_LIVE, &current_live, sizeof current_live)) return false;
++    if (current_live != sample->live) return botw_touch_read_failed(BOTW_TOUCH_UNSTABLE);
++    if (!runtime_botw_touch_copy_main_pointer(main, GDT_INSTANCE, &current_instance)) return false;
++    return current_instance == sample->instance || botw_touch_read_failed(BOTW_TOUCH_UNSTABLE);
++}
++
++static bool rune_buffers_match(const RuneSample *first, const RuneSample *second) {
++    return first->instance == second->instance && first->live == second->live &&
++           !memcmp(&first->bools, &second->bools, sizeof first->bools) &&
++           !memcmp(&first->s32s, &second->s32s, sizeof first->s32s);
++}
++#endif
++
++void botw_touch_snapshot_diagnostic(BOTWTouchSnapshot *out, uint32_t *reasons) {
++    if (reasons) *reasons = 0;
++    if (!out) return;
++    *out = (BOTWTouchSnapshot){ .selected_rune = -1 };
++#if BOTW_TOUCH_ENABLED || defined(BOTW_TOUCH_TEST)
++#if !defined(BOTW_TOUCH_TEST)
++    if (pthread_main_np()) {
++        if (reasons) *reasons = 1u << BOTW_TOUCH_RUNTIME_UNAVAILABLE;
++        return;
++    }
++#endif
++    uintptr_t main = atomic_load_explicit(&game_main, memory_order_acquire);
++    if (!main) {
++        if (reasons) *reasons = 1u << BOTW_TOUCH_RUNTIME_UNAVAILABLE;
++        return;
++    }
++
++    EquipmentSample equipment[2] = {0};
++    if (sample_equipment(main, &equipment[0]) && sample_equipment(main, &equipment[1]) &&
++        equipment_matches(&equipment[0], &equipment[1])) {
++        out->equipment_known = true;
++        memcpy(out->equipped, equipment[0].equipped, sizeof out->equipped);
++    }
++
++    uint32_t *previous = rune_reasons;
++    rune_reasons = reasons;
++    RuneSample runes[2] = {0};
++    if (sample_runes(main, &runes[0]) && sample_runes(main, &runes[1])) {
++        if (!rune_buffers_match(&runes[0], &runes[1])) {
++            botw_touch_read_failed(BOTW_TOUCH_UNSTABLE);
++        } else {
++            if (runes[0].selected == runes[1].selected) out->selected_rune = runes[0].selected;
++            else botw_touch_read_failed(BOTW_TOUCH_UNSTABLE);
++            if (runes[0].owned_known && runes[1].owned_known) {
++                if (runes[0].owned == runes[1].owned) {
++                    out->owned_runes_known = true;
++                    out->owned_runes = runes[0].owned;
++                } else botw_touch_read_failed(BOTW_TOUCH_UNSTABLE);
++            }
++        }
++    }
++    rune_reasons = previous;
++#endif
++}
++
++void botw_touch_snapshot(BOTWTouchSnapshot *out) {
++    botw_touch_snapshot_diagnostic(out, NULL);
++}

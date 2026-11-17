@@ -1,0 +1,191 @@
+{
+  "schema": 1,
+  "upstream": "https://github.com/ly05010419/MacNativeGames",
+  "upstream_commit": "ea1ce3b2be23540c4d67df95695f8c70f66cd8e0",
+  "published_repository_base": "0550c96dcc35703e777df58b114ee3828d5ba03a",
+  "files": [
+    {
+      "file": "cloud/CloudSaveCore.swift",
+      "sha256": "08d69a8bc2812046785eb9a17d582972dfa5513a4e82ebcf2312e134232bf60d",
+      "local_source": "cloud/CloudSaveCore.swift",
+      "bytes": 25337
+    },
+    {
+      "file": "cloud/CloudTests.swift",
+      "sha256": "7dcfdbc2ede97051edb5495a80a1a9c32b836f6a6b9b486532f51f66da398e34",
+      "local_source": "cloud/CloudTests.swift",
+      "bytes": 5334
+    },
+    {
+      "file": "cloud/CloudRecoveryTests.swift",
+      "sha256": "3129f0a426f17be797a8785d88ead8604370c9534f1506301a8b83c97cbbdc89",
+      "local_source": "cloud/CloudRecoveryTests.swift",
+      "bytes": 11246
+    },
+    {
+      "file": "screenfit/screenfit_viewport.h",
+      "sha256": "83ae99c298e1654753595a5428f1d609c173233296fd221e6f62b9337495b31a",
+      "local_source": "mac-screenfit-20261110/screenfit_viewport.h",
+      "bytes": 544
+    },
+    {
+      "file": "screenfit/measure_trial.py",
+      "sha256": "efc096b003e4e5224a52bc6992aee0a59113d737c50e3f03ad34d7f4f4ecd4bb",
+      "local_source": "mac-screenfit-20261110/measure_trial.py",
+      "bytes": 1321
+    },
+    {
+      "file": "ui/BOTWSheikahHUD.h",
+      "sha256": "a37c8ee12c0793723bd4c8727e1b9da4ecc85d9308d3beec2a7c76a42355c854",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/BOTWSheikahHUD.h",
+      "bytes": 2851
+    },
+    {
+      "file": "ui/BOTWSheikahHUD.m",
+      "sha256": "a549701afcc9dcecfb484151959a06763317ea5cdf21c442950c37af5be92f6e",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/BOTWSheikahHUD.m",
+      "bytes": 26443,
+      "original_local_sha256": "2587630266aadf6cd9a4c8c07564a072ce71a939a43c5a7fce7231fb9338ace9",
+      "publication_edits": "Replaced the procedural game settings emblem with system gearshape.fill and directed the attribution to the included notice. Local original unchanged."
+    },
+    {
+      "file": "ui/BOTWSheikahEditor.h",
+      "sha256": "e3b1809aa63a6c8a6dfc482561b3e4abb45703aea80a16784706e1edf1bd98a4",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/BOTWSheikahEditor.h",
+      "bytes": 362
+    },
+    {
+      "file": "ui/BOTWSheikahEditor.m",
+      "sha256": "06d064df8cc26b9c3e3e9af7c1e78530c1ba03dc64f05401a348822abe1fb48a",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/BOTWSheikahEditor.m",
+      "bytes": 18301
+    },
+    {
+      "file": "ui/BOTWGraphicsSettings.h",
+      "sha256": "9f4f3a4d31d957e4abb8ad07195bafcb9e5837c28251ed3f383529bece721e5a",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/BOTWGraphicsSettings.h",
+      "bytes": 1925
+    },
+    {
+      "file": "ui/BOTWGraphicsSettings.m",
+      "sha256": "600ddc0a70829a247f7792a013fbcea769bf286cea503d845714d496018f33b1",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/BOTWGraphicsSettings.m",
+      "bytes": 26499
+    },
+    {
+      "file": "ui/touch_pad.h",
+      "sha256": "2e089c86b94c983134aa5ac329cfc816ca9028e93dbe4ed9e424b4711ef2882e",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/touch_pad.h",
+      "bytes": 968
+    },
+    {
+      "file": "ui/touch_pad.m",
+      "sha256": "c983bbc226c3ce20f844bb329fe29cd6e7ac8db69644914362ceadd3709f5d57",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/touch_pad.m",
+      "bytes": 54231
+    },
+    {
+      "file": "ui/botw_picture.h",
+      "sha256": "b4fd47535f72ce33f84db0966e014f6ad9146473da3a64ad289a8fa35fd25732",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/botw_picture.h",
+      "bytes": 1033
+    },
+    {
+      "file": "ui/botw_touch.h",
+      "sha256": "4b6df6de2ee37e9e0eea3a3bf01cd7e790932f9b0ba54fd348da8fc3b72a3fc4",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/botw_touch.h",
+      "bytes": 1618
+    },
+    {
+      "file": "ui/botw_scene_resolution.h",
+      "sha256": "488c938a2a570e89d1298629ce9b4aeef1524a63f684fd108b7bcf2ee03d6d0a",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/botw_scene_resolution.h",
+      "bytes": 685
+    },
+    {
+      "file": "ui/runtime.h",
+      "sha256": "ab51cd5005e0305729038625ea9c0d8338277ba4584c681d5755b1c674101199",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/runtime.h",
+      "bytes": 12992
+    },
+    {
+      "file": "ui/fps_overlay.h",
+      "sha256": "9e5b77973f261bff0a02a264b3e93467e3b33c6a88e5a170a8ab158038312185",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/third_party/d2r_gfx/gfx/nvn/fps_overlay.h",
+      "bytes": 5006
+    },
+    {
+      "file": "backend/botw_touch.h",
+      "sha256": "4b6df6de2ee37e9e0eea3a3bf01cd7e790932f9b0ba54fd348da8fc3b72a3fc4",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/botw_touch.h",
+      "bytes": 1618
+    },
+    {
+      "file": "backend/botw_touch_internal.h",
+      "sha256": "62670f580cec2772ea0fbf2ff641ba5fb93b514780a4cf6df6134738f256945b",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/botw_touch_internal.h",
+      "bytes": 1751
+    },
+    {
+      "file": "backend/botw_touch_license.h",
+      "sha256": "3d1cefca2b6e4a7c2999535391615397c8a4e3478b39d45c8dd5d91aaabcbdc3",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/botw_touch_license.h",
+      "bytes": 1463
+    },
+    {
+      "file": "backend/botw_touch_state.c",
+      "sha256": "d7c1f10bae584e7304aed10347204dd2379cd06db17b7214fb50a1f39b9429ec",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/botw_touch_state.c",
+      "bytes": 12184
+    },
+    {
+      "file": "backend/botw_touch_icons.c",
+      "sha256": "de018dac88eb0bbd98490642a840e851457c25191f46dc80f79a44c9bb103863",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/botw_touch_icons.c",
+      "bytes": 6048
+    },
+    {
+      "file": "tests/snapshot.c",
+      "sha256": "f7e4cb2abe51a0bac5d8c83f282ba195ccd93afb96f76d9b6bd23ad58e695854",
+      "local_source": "iphone-hud-editor-20261110/backend-tests/snapshot.c",
+      "bytes": 9457
+    },
+    {
+      "file": "tests/disabled.c",
+      "sha256": "0942c9808eeb1151eb047693f401ab4effca222f2335132ff69b7ef444ba4bb4",
+      "local_source": "iphone-hud-editor-20261110/backend-tests/disabled.c",
+      "bytes": 454
+    },
+    {
+      "file": "ui/main.m",
+      "sha256": "db2fd36319ea50aa65ef7cb562e753b9e3e24bc3bda0b40a044b65fcb1d79e8b",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/main.m",
+      "bytes": 53189
+    },
+    {
+      "file": "cloud/BOTWCloudController.swift",
+      "sha256": "b07b940324267d5f6f5d231a3f3b0f3e5a0f17ea471aa21ddfba828ad4e1c03a",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/ios/Sources/BOTWCloudController.swift",
+      "bytes": 12332
+    },
+    {
+      "file": "ui/input.c",
+      "sha256": "f749dcf9c2bc515992a6cdaf35c1d2374f2c237de4000148e865a66a360dbab7",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/input.c",
+      "bytes": 23944
+    },
+    {
+      "file": "ui/gamepad.m",
+      "sha256": "eb9bfc2a34fb5c28c672ba27cc759fa030e6e6bae686edbe57be0086aef068bc",
+      "local_source": "iphone-scene-camera-20261110/MacNativeGames/games/totk/runtime/gamepad.m",
+      "bytes": 37426
+    },
+    {
+      "file": "ps4/stage_icons.py",
+      "sha256": "d6ce412d157e49f551ab88c8d01d3a2871c23d4969d96bf867201f8bf070ed09",
+      "local_source": "mac-ps4-icons-20261110/stage_icons.py",
+      "bytes": 17835
+    }
+  ],
+  "scope": "Source-only reference modules. No complete game build or device-install recipe."
+}
